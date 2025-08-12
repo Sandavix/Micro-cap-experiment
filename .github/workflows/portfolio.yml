@@ -16,6 +16,8 @@ jobs:
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       EXECUTE_PAPER: ${{ vars.EXECUTE_PAPER || 'false' }}
+      ALPACA_BASE_URL: https://paper-api.alpaca.markets
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
