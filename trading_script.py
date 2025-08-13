@@ -14,6 +14,9 @@ import yfinance as yf
 from typing import Any, cast
 import os
 import time
+import sys
+import argparse
+
 
 # Shared file locations
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -610,3 +613,37 @@ def load_latest_portfolio_state(
     print(latest_tickers)
     return latest_tickers, cash
 
+# --- CLI entry point added to make the script runnable & CI-friendly ---
+def main(file: str, data_dir: Path | None = None, interactive: bool | None = None) -> None:
+    """Run the trading script."""
+    chatgpt_portfolio, cash = load_latest_portfolio_state(file)
+    if data_dir is not None:
+        set_data_dir(data_dir)
+
+    if interactive is None:
+        import sys as _sys, os as _os
+        interactive = not (
+            _os.environ.get("GITHUB_ACTIONS") == "true"
+            or _os.environ.get("CI") == "true"
+            or not _sys.stdin.isatty()
+        )
+
+    chatgpt_portfolio, cash = process_portfolio(chatgpt_portfolio, cash, interactive=interactive)
+    daily_results(chatgpt_portfolio, cash)
+
+if __name__ == "__main__":
+    import argparse as _argparse
+    parser = _argparse.ArgumentParser(description="Maintain/compute daily results for the ChatGPT micro-cap portfolio.")
+    parser.add_argument("-f", "--file", required=True,
+                        help="Path to the portfolio CSV containing historical records.")
+    parser.add_argument("-d", "--data-dir", default=None,
+                        help="Directory to write chatgpt_portfolio_update.csv and chatgpt_trade_log.csv")
+    ig = parser.add_mutually_exclusive_group()
+    ig.add_argument("--interactive", dest="interactive", action="store_true",
+                    help="Force prompts for manual trades.")
+    ig.add_argument("--non-interactive", dest="interactive", action="store_false",
+                    help="Disable prompts (useful for CI).")
+    parser.set_defaults(interactive=None)
+    args = parser.parse_args()
+
+    main(args.file, Path(args.data_dir) if args.data_dir else None, interactive=args.interactive)
