@@ -1,15 +1,17 @@
 name: Trader (Paper)
 
 on:
-  workflow_dispatch: {}      # lancement manuel
+  workflow_dispatch: {}
   push:
     paths:
       - "trading_script.py"
       - "requirements.txt"
       - ".github/workflows/trader.yml"
+  # schedule:
+  #   - cron: "32 13 * * 1-5"  # ex: 13:32 UTC les jours de bourse
 
 permissions:
-  contents: write            # nécessaire pour commit/push des artefacts JSON/log
+  contents: write
 
 concurrency:
   group: trader-paper
@@ -21,17 +23,13 @@ jobs:
     timeout-minutes: 30
 
     env:
-      # ——— Secrets existants ———
+      TZ: America/New_York
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-
-      # ——— Variables attendues par le SDK Alpaca ———
       APCA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY }}
       APCA_API_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       APCA_API_BASE_URL: https://paper-api.alpaca.markets
-
-      # On force le mode paper côté bash/python
       EXECUTE_PAPER: "true"
 
     steps:
@@ -56,12 +54,27 @@ jobs:
             sudo apt-get install -y jq >/dev/null 2>&1 || true
           fi
 
+      - name: Quick diagnostics
+        run: |
+          echo "PWD: $(pwd)"
+          echo "Repo files:"
+          ls -al
+          echo "Python:"
+          python --version
+          python - <<'PY'
+          import sys, os
+          print("sys.executable:", sys.executable)
+          print("sys.path[0:3]:", sys.path[:3])
+          f = "trading_script.py"
+          print("trading_script.py exists:", os.path.exists(f))
+          if os.path.exists(f):
+              print("size(bytes):", os.path.getsize(f))
+          PY
+
       - name: Sanity check Alpaca (Paper)
         run: |
           python - <<'PY'
-          import os, json, sys
-          import urllib.request
-
+          import os, json, urllib.request
           base = os.environ.get('APCA_API_BASE_URL', 'https://paper-api.alpaca.markets')
           req = urllib.request.Request(
               f"{base}/v2/account",
@@ -70,64 +83,57 @@ jobs:
                   "APCA-API-SECRET-KEY": os.environ["APCA_API_SECRET_KEY"],
               }
           )
-          try:
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  body = r.read().decode("utf-8", "replace")
-                  print("status_code:", r.status)
-                  try:
-                      print(json.dumps(json.loads(body), indent=2))
-                  except Exception:
-                      print(body)
-                  if r.status != 200:
-                      sys.exit(1)
-          except Exception as e:
-              print("Sanity check failed:", e)
-              sys.exit(1)
+          with urllib.request.urlopen(req, timeout=20) as r:
+              data = json.loads(r.read().decode())
+          subset = {k: data[k] for k in ("status","equity","cash","buying_power","pattern_day_trader","trading_blocked")}
+          print(json.dumps(subset, indent=2))
           PY
 
-      - name: Run trader (Paper) + dump infos
+      - name: Run trader (Paper) + capture logs and paper state
         run: |
           set -Eeuo pipefail
-          echo "EXECUTE_PAPER=${EXECUTE_PAPER}"
-          python --version
+          echo "--- START $(date -Is) ---" | tee run.log
+          echo "EXECUTE_PAPER=${EXECUTE_PAPER}" | tee -a run.log
 
           PAPER_URL="https://paper-api.alpaca.markets"
 
-          echo "---- Alpaca clock (paper) ----"
+          echo "---- Alpaca clock (paper) ----" | tee -a run.log
           curl -s \
             -H "APCA-API-KEY-ID: ${APCA_API_KEY_ID}" \
             -H "APCA-API-SECRET-KEY: ${APCA_API_SECRET_KEY}" \
-            "${PAPER_URL}/v2/clock" | jq -r '"is_open=\(.is_open) next_open=\(.next_open) next_close=\(.next_close)"' || true
+            "${PAPER_URL}/v2/clock" \
+            | jq -r '"is_open=\(.is_open) next_open=\(.next_open) next_close=\(.next_close)"' \
+            | tee -a run.log || true
 
           if [[ "${EXECUTE_PAPER}" == "true" ]]; then
-            echo "[RUN] Paper trading ON"
+            echo "[RUN] Paper trading ON" | tee -a run.log
             export APCA_API_BASE_URL="${PAPER_URL}"
-            python -u trading_script.py 2>&1 | tee run.log
+            set +e
+            python -u trading_script.py 2>&1 | tee -a run.log
+            PY_EXIT=${PIPESTATUS[0]}
+            set -e
           else
-            echo "[RUN] Dry-run (no orders sent)"
-            python -u trading_script.py --dry-run 2>&1 | tee run.log
+            echo "[RUN] Dry-run (no orders sent)" | tee -a run.log
+            set +e
+            python -u trading_script.py --dry-run 2>&1 | tee -a run.log
+            PY_EXIT=${PIPESTATUS[0]}
+            set -e
           fi
 
-          echo "---- run.log stats ----"
-          test -f run.log && { echo "bytes=$(wc -c < run.log)  lines=$(wc -l < run.log)"; } || echo "run.log missing"
-          echo "---- tail run.log (last 200) ----"
-          tail -n 200 run.log || true
+          echo "---- python exit=${PY_EXIT} ----" | tee -a run.log
 
-          echo "---- Verify recent Alpaca orders (Paper, last 5) ----"
+          echo "---- Verify recent Alpaca orders (Paper, last 5) ----" | tee -a run.log
           curl -s \
             -H "APCA-API-KEY-ID: ${APCA_API_KEY_ID}" \
             -H "APCA-API-SECRET-KEY: ${APCA_API_SECRET_KEY}" \
             "${PAPER_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_paper.json || echo "[]" > alpaca_orders_paper.json
-          echo "RAW (paper orders):"
-          jq -c '.' alpaca_orders_paper.json || cat alpaca_orders_paper.json || true
-          echo "PARSED (paper orders):"
-          jq -r 'if type=="array" then
+          jq -r 'if type=="array" and length>0 then
                     .[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"
                  else
-                    "Not an array: type=\(type)"
-                 end' alpaca_orders_paper.json || true
+                    "[]"
+                 end' alpaca_orders_paper.json | tee -a run.log || true
 
-          echo "---- Positions (Paper) ----"
+          echo "---- Positions (Paper) ----" | tee -a run.log
           curl -s \
             -H "APCA-API-KEY-ID: ${APCA_API_KEY_ID}" \
             -H "APCA-API-SECRET-KEY: ${APCA_API_SECRET_KEY}" \
@@ -135,10 +141,10 @@ jobs:
           jq -r 'if type=="array" and length>0 then
                     .[] | "\(.symbol) qty=\(.qty) avg_entry=\(.avg_entry_price)"
                  else
-                    "No positions or non-array."
-                 end' alpaca_positions_paper.json || true
+                    "[]"
+                 end' alpaca_positions_paper.json | tee -a run.log || true
 
-          echo "---- Activities FILL (Paper, recent) ----"
+          echo "---- Activities FILL (Paper, recent) ----" | tee -a run.log
           curl -s \
             -H "APCA-API-KEY-ID: ${APCA_API_KEY_ID}" \
             -H "APCA-API-SECRET-KEY: ${APCA_API_SECRET_KEY}" \
@@ -146,15 +152,32 @@ jobs:
           jq -r 'if type=="array" and length>0 then
                     .[] | "\(.transaction_time // "?") \(.symbol // "?") \(.side // "?") qty=\(.qty // "?") price=\(.price // "?")"
                  else
-                    "No fills or non-array."
-                 end' activities_paper.json || true
+                    "[]"
+                 end' activities_paper.json | tee -a run.log || true
 
-      - name: Commit & push artifacts
+          echo "--- END $(date -Is) ---" | tee -a run.log
+          # Fail the step if python failed
+          test "${PY_EXIT}" -eq 0
+
+      - name: Upload artifacts (run.log + JSON)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trader-paper-${{ github.run_id }}
+          path: |
+            run.log
+            alpaca_orders_paper.json
+            alpaca_positions_paper.json
+            activities_paper.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Commit & push JSON + run.log
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add run.log alpaca_orders_paper.json alpaca_positions_paper.json activities_paper.json || true
           git commit -m "Auto run $(date -u +%F)" || echo "No changes"
           git pull --rebase || true
           git push || true
