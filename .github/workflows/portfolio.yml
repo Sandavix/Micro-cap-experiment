@@ -53,12 +53,22 @@ jobs:
         run: |
           set -e
           D=$(date -u +%F)
+
           if [ -f "plans/plan_${D}.json" ]; then
             P="plans/plan_${D}.json"
             echo "Plan JSON: $P"
-            python -c "import json,sys; d=json.load(open(sys.argv[1])); \
-print('Decision count:', len(d.get('decisions', []))); \
-[print(r) for r in d.get('decisions', [])[:3]]" "$P"
+            export P
+            python - <<'PY'
+import json, os
+p = os.environ["P"]
+with open(p, "r") as f:
+    d = json.load(f)
+decisions = d.get("decisions", [])
+print("Decision count:", len(decisions))
+for r in decisions[:3]:
+    print(r)
+PY
+
           elif [ -f "plans/plan_${D}.csv" ]; then
             P="plans/plan_${D}.csv"
             echo "Plan CSV: $P"
