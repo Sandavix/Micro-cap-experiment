@@ -49,36 +49,33 @@ jobs:
             echo "trading_script.py introuvable"; exit 1
           fi
 
-      - name: Debug plan (count + aperçu)
+      - name: Debug plan (count + preview)
         run: |
           set -e
           D=$(date -u +%F)
           if [ -f "plans/plan_${D}.json" ]; then
-            echo "Plan JSON trouvé: plans/plan_${D}.json"
-            python - <<'PY'
-import json, os
-p=f"plans/plan_{os.popen('date -u +%F').read().strip()}.json"
-d=json.load(open(p))
-print("Decision count:", len(d.get("decisions", [])))
-for r in d.get("decisions", [])[:3]:
-    print(r)
-PY
+            P="plans/plan_${D}.json"
+            echo "Plan JSON: $P"
+            python -c "import json,sys; d=json.load(open(sys.argv[1])); \
+print('Decision count:', len(d.get('decisions', []))); \
+[print(r) for r in d.get('decisions', [])[:3]]" "$P"
           elif [ -f "plans/plan_${D}.csv" ]; then
-            echo "Plan CSV trouvé: plans/plan_${D}.csv"
-            cnt=$(( $(wc -l < "plans/plan_${D}.csv") - 1 ))
+            P="plans/plan_${D}.csv"
+            echo "Plan CSV: $P"
+            cnt=$(( $(wc -l < "$P") - 1 ))
             echo "Decision count: $cnt"
-            head -n 5 "plans/plan_${D}.csv" || true
+            head -n 5 "$P" || true
           else
             echo "Aucun plan trouvé pour ${D}"
           fi
 
       - name: Commit plan snapshot (optional)
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add plans/ || true
-          git commit -m "Plan snapshot $(date -u +%F)" || echo "No changes"
-          git push || true
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add plans/ || true
+            git commit -m "Plan snapshot $(date -u +%F)" || echo "No changes"
+            git push || true
 
       # --- Exécution conditionnelle ---
       - name: Debug EXECUTE_PAPER
@@ -100,20 +97,11 @@ PY
         run: |
           curl -s "$ALPACA_BASE_URL/v2/orders?status=all&limit=3" \
             -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
-            -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" | python - <<'PY'
-import sys, json
-try:
-    data=json.load(sys.stdin)
-    orders=data.get('orders', data)
-    if not orders:
-        print("Aucun ordre récent (Paper).")
-    else:
-        for o in orders[:3]:
-            print(o.get("submitted_at"), o.get("symbol"), o.get("side"),
-                  o.get("qty"), o.get("type"), o.get("status"))
-except Exception as e:
-    print("Impossible de lire la réponse Alpaca:", e)
-PY
+            -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" | \
+          python -c "import sys,json; \
+data=json.load(sys.stdin); orders=data.get('orders', data) or []; \
+print('Aucun ordre récent (Paper).' if not orders else '\n'.join( \
+f\"{o.get('submitted_at')} {o.get('symbol')} {o.get('side')} {o.get('qty')} {o.get('type')} {o.get('status')}\" for o in orders[:3]))"
 
       - name: Upload plans as artifact
         if: always()
@@ -122,3 +110,4 @@ PY
           name: plans-${{ github.run_id }}
           path: plans/
           if-no-files-found: ignore
+
