@@ -64,10 +64,10 @@ jobs:
           if [[ "${EXECUTE_PAPER}" == "true" ]]; then
             echo "[RUN] Paper trading ON"
             export APCA_API_BASE_URL="${PAPER_URL}"   # force l'SDK sur Paper
-            python -u trading_script.py | tee run.log
+            python -u trading_script.py 2>&1 | tee run.log
           else
             echo "[RUN] Dry-run (no orders sent)"
-            python -u trading_script.py --dry-run | tee run.log
+            python -u trading_script.py --dry-run 2>&1 | tee run.log
           fi
 
           echo "---- run.log stats ----"
@@ -75,20 +75,50 @@ jobs:
           echo "---- tail run.log (last 200) ----"
           tail -n 200 run.log || true
 
-          # --- Verify with Alpaca (did anything actually go out?) ---
+          # --- Verify with Alpaca (Paper orders) ---
           echo "---- Verify recent Alpaca orders (Paper, last 5) ----"
           curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
             "${PAPER_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_paper.json || echo "[]"
-          COUNT_PAPER=$(jq 'length' alpaca_orders_paper.json 2>/dev/null || echo 0)
-          echo "[ALPACA/PAPER] orders_returned=${COUNT_PAPER}"
-          jq -r '.[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"' alpaca_orders_paper.json || true
+          echo "RAW (paper orders):"
+          jq -c '.' alpaca_orders_paper.json || cat alpaca_orders_paper.json || true
+          echo "PARSED (paper orders):"
+          jq -r 'if type=="array" then
+                    .[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"
+                 else
+                    "Not an array: type=\(type)"
+                 end' alpaca_orders_paper.json || true
 
+          # --- Positions & Fills (Paper) ---
+          echo "---- Positions (Paper) ----"
+          curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
+            "${PAPER_URL}/v2/positions" > alpaca_positions_paper.json || echo "[]"
+          jq -r 'if type=="array" and length>0 then
+                    .[] | "\(.symbol) qty=\(.qty) avg_entry=\(.avg_entry_price)"
+                 else
+                    "No positions or non-array."
+                 end' alpaca_positions_paper.json || true
+
+          echo "---- Activities FILL (Paper, recent) ----"
+          curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
+            "${PAPER_URL}/v2/account/activities?activity_types=FILL&direction=desc&page_size=25" > activities_paper.json || echo "[]"
+          jq -r 'if type=="array" and length>0 then
+                    .[] | "\(.transaction_time // "?") \(.symbol // "?") \(.side // "?") qty=\(.qty // "?") price=\(.price // "?")"
+                 else
+                    "No fills or non-array."
+                 end' activities_paper.json || true
+
+          # --- Verify with Alpaca (Live orders) - pour check rapide d'un mauvais endpoint ---
           echo "---- Verify recent Alpaca orders (Live, last 5) ----"
           curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
             "${LIVE_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_live.json || echo "[]"
-          COUNT_LIVE=$(jq 'length' alpaca_orders_live.json 2>/dev/null || echo 0)
-          echo "[ALPACA/LIVE] orders_returned=${COUNT_LIVE}"
-          jq -r '.[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"' alpaca_orders_live.json || true
+          echo "RAW (live orders):"
+          jq -c '.' alpaca_orders_live.json || cat alpaca_orders_live.json || true
+          echo "PARSED (live orders):"
+          jq -r 'if type=="array" then
+                    .[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"
+                 else
+                    "Not an array: type=\(type)"
+                 end' alpaca_orders_live.json || true
 
       - name: Commit outputs
         if: always()
