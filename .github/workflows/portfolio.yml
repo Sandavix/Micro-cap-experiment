@@ -1,9 +1,10 @@
 name: portfolio-bot
 
 on:
-  schedule:
-    - cron: "35 13 * * 1-5"   # 13:35 UTC = 15:35 Vevey (été)
   workflow_dispatch:
+  schedule:
+    # 13:35 UTC ≈ 15:35 en été en Suisse (marchés US ouverts +5 min)
+    - cron: '35 13 * * 1-5'
 
 permissions:
   contents: write
@@ -14,110 +15,81 @@ concurrency:
 
 jobs:
   run:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      EXECUTE_PAPER: ${{ vars.EXECUTE_PAPER || 'false' }}
-      ALPACA_BASE_URL: https://paper-api.alpaca.markets
-      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # --- Génération/validation ---
-      - name: Dry run (plan only)
         run: |
-          if [ -f "trading_script.py" ]; then
-            python -u trading_script.py --dry-run
-          elif [ -f "Scripts and CSV Files/trading_script.py" ]; then
-            python -u "Scripts and CSV Files/trading_script.py" --dry-run
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # --- Bloc corrigé : Debunk Error (on garde exactement cet esprit) ---
+      - name: Debunk Error (run & verify)
+        env:
+          # On respecte ta variable repo existante (casse incluse)
+          EXECUTE_PAPER: ${{ vars.executePaper }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: |
+          set -Eeuo pipefail
+
+          echo "executePaper=${EXECUTE_PAPER}"
+          python --version
+
+          # --- Run trading script (comme Nathan) ---
+          if [[ "${EXECUTE_PAPER}" == "true" ]]; then
+            echo "[RUN] Paper trading ON"
+            python trading_script.py | tee run.log
           else
-            echo "trading_script.py introuvable"; exit 1
+            echo "[RUN] Dry-run (no orders sent)"
+            python trading_script.py --dry-run | tee run.log
           fi
 
-      - name: Debug plan (count + preview)
-        run: |
-          set -e
-          D=$(date -u +%F)
+          echo "---- tail run.log (last 200) ----"
+          tail -n 200 run.log || true
 
-          if [ -f "plans/plan_${D}.json" ]; then
-            P="plans/plan_${D}.json"
-            echo "Plan JSON: $P"
-            export P
-            python - <<'PY'
-import json, os
-p = os.environ["P"]
-with open(p, "r") as f:
-    d = json.load(f)
-decisions = d.get("decisions", [])
-print("Decision count:", len(decisions))
-for r in decisions[:3]:
-    print(r)
+          # --- Verify with Alpaca (did anything actually go out?) ---
+          echo "---- Verify recent Alpaca orders (last 5) ----"
+          BASE_URL="https://paper-api.alpaca.markets"
+          ORDERS_JSON=$(curl -s \
+            -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
+            -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
+            "${BASE_URL}/v2/orders?status=all&limit=5&direction=desc" || echo "[]")
+          echo "$ORDERS_JSON" > alpaca_orders.json
+
+          python - <<'PY'
+import json, sys
+try:
+    data = json.load(open("alpaca_orders.json"))
+    if isinstance(data, dict) and data.get("code"):
+        print("[ALPACA] API error:", data)
+    else:
+        print(f"[ALPACA] orders_returned={len(data)}")
+        for o in data:
+            print(f"{o.get('submitted_at','?')}  {o.get('symbol','?')}  {o.get('side','?')}  qty={o.get('qty','?')}  status={o.get('status','?')}  id={o.get('id','?')}")
+except Exception as e:
+    print("[ALPACA] Failed to parse response:", e)
+    sys.exit(0)
 PY
 
-          elif [ -f "plans/plan_${D}.csv" ]; then
-            P="plans/plan_${D}.csv"
-            echo "Plan CSV: $P"
-            cnt=$(( $(wc -l < "$P") - 1 ))
-            echo "Decision count: $cnt"
-            head -n 5 "$P" || true
-          else
-            echo "Aucun plan trouvé pour ${D}"
-          fi
-
-      - name: Commit plan snapshot (optional)
-        run: |
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add plans/ || true
-            git commit -m "Plan snapshot $(date -u +%F)" || echo "No changes"
-            git push || true
-
-      # --- Exécution conditionnelle ---
-      - name: Debug EXECUTE_PAPER
-        run: echo "EXECUTE_PAPER=$EXECUTE_PAPER"
-
-      - name: Execute on Alpaca (Paper)
-        if: env.EXECUTE_PAPER == 'true'
-        run: |
-          if [ -f "trading_script.py" ]; then
-            python -u trading_script.py
-          elif [ -f "Scripts and CSV Files/trading_script.py" ]; then
-            python -u "Scripts and CSV Files/trading_script.py"
-          else
-            echo "trading_script.py introuvable"; exit 1
-          fi
-
-      - name: Show last 3 Alpaca orders (Paper)
-        if: env.EXECUTE_PAPER == 'true'
-        run: |
-          curl -s "$ALPACA_BASE_URL/v2/orders?status=all&limit=3" \
-            -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
-            -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" | \
-          python -c "import sys,json; \
-data=json.load(sys.stdin); orders=data.get('orders', data) or []; \
-print('Aucun ordre récent (Paper).' if not orders else '\n'.join( \
-f\"{o.get('submitted_at')} {o.get('symbol')} {o.get('side')} {o.get('qty')} {o.get('type')} {o.get('status')}\" for o in orders[:3]))"
-
-      - name: Upload plans as artifact
+      - name: Commit outputs
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: plans-${{ github.run_id }}
-          path: plans/
-          if-no-files-found: ignore
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Auto run $(date -u +%F)" || echo "No changes"
+          git pull --rebase || true
+          git push || true
 
