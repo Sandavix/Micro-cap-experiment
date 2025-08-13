@@ -1,13 +1,22 @@
---- START 2025-08-13T12:44:16-04:00 ---
-EXECUTE_PAPER=true
+--- DISCOVERY 2025-08-13T13:00:14-04:00 ---
+---- trading_script.py --help ----
+---- help exit=0 ----
+---- grep argparse ----
+(no argparse hits)
+---- grep logging ----
+(no logging hits)
+---- grep Alpaca env usage ----
+(no Alpaca env hits)
+--- RUN 2025-08-13T13:00:14-04:00 ---
 ---- Alpaca clock (paper) ----
 is_open=true next_open=2025-08-14T09:30:00-04:00 next_close=2025-08-13T16:00:00-04:00
 [RUN] Paper trading ON
 ---- python exit=0 ----
+---- Collect local *.log (tail 200) ----
+(no extra .log files)
 ---- Verify recent Alpaca orders (Paper, last 5) ----
 []
 ---- Positions (Paper) ----
 []
 ---- Activities FILL (Paper, recent) ----
 []
---- END 2025-08-13T12:44:17-04:00 ---
