@@ -34,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Bloc corrigé : Debunk Error (on garde exactement cet esprit) ---
+      # --- Bloc corrigé : Debunk Error (run & verify) ---
       - name: Debunk Error (run & verify)
         env:
           # On respecte ta variable repo existante (casse incluse)
@@ -62,26 +62,20 @@ jobs:
           # --- Verify with Alpaca (did anything actually go out?) ---
           echo "---- Verify recent Alpaca orders (last 5) ----"
           BASE_URL="https://paper-api.alpaca.markets"
-          ORDERS_JSON=$(curl -s \
+          curl -s \
             -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
             -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
-            "${BASE_URL}/v2/orders?status=all&limit=5&direction=desc" || echo "[]")
-          echo "$ORDERS_JSON" > alpaca_orders.json
+            "${BASE_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders.json || echo "[]"
 
-          python - <<'PY'
-import json, sys
-try:
-    data = json.load(open("alpaca_orders.json"))
-    if isinstance(data, dict) and data.get("code"):
-        print("[ALPACA] API error:", data)
-    else:
-        print(f"[ALPACA] orders_returned={len(data)}")
-        for o in data:
-            print(f"{o.get('submitted_at','?')}  {o.get('symbol','?')}  {o.get('side','?')}  qty={o.get('qty','?')}  status={o.get('status','?')}  id={o.get('id','?')}")
-except Exception as e:
-    print("[ALPACA] Failed to parse response:", e)
-    sys.exit(0)
-PY
+          # jq est généralement présent, sinon on l'installe vite fait
+          if ! command -v jq >/dev/null 2>&1; then
+            sudo apt-get update -y >/dev/null 2>&1 || true
+            sudo apt-get install -y jq >/dev/null 2>&1 || true
+          fi
+
+          COUNT=$(jq 'length' alpaca_orders.json 2>/dev/null || echo 0)
+          echo "[ALPACA] orders_returned=${COUNT}"
+          jq -r '.[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"' alpaca_orders.json || true
 
       - name: Commit outputs
         if: always()
@@ -92,4 +86,3 @@ PY
           git commit -m "Auto run $(date -u +%F)" || echo "No changes"
           git pull --rebase || true
           git push || true
-
