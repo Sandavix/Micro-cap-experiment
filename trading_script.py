@@ -524,15 +524,25 @@ def daily_results(chatgpt_portfolio: pd.DataFrame, cash: float) -> None:
     print(f"Latest ChatGPT Equity: ${final_equity:.2f}")
     # Get S&P 500 data
     final_date = totals.loc[totals.index[-1], "Date"]
-    spx = yf.download("^SPX", start="2025-06-27", end=final_date + pd.Timedelta(days=1), progress=False)
-    spx = cast(pd.DataFrame, spx)
-    spx = spx.reset_index()
+    bench = yf.download("^GSPC", start="2025-06-27", end=final_date + pd.Timedelta(days=1), progress=False)
+    bench = cast(pd.DataFrame, bench).reset_index()
 
-    # Normalize to $100
-    initial_price = spx["Close"].iloc[0].item()
-    price_now = spx["Close"].iloc[-1].item()
-    scaling_factor = 100 / initial_price
-    spx_value = price_now * scaling_factor
+    # Fallback to SPY if ^GSPC fails or is empty
+    if bench.empty or "Close" not in bench:
+        fallback = yf.download("SPY", start="2025-06-27", end=final_date + pd.Timedelta(days=1), progress=False)
+        bench = cast(pd.DataFrame, fallback).reset_index()
+
+    # Normalize to $100 (guard for empty frame)
+    if bench.empty or "Close" not in bench or bench["Close"].dropna().empty:
+        initial_price = float("nan")
+        price_now = float("nan")
+        scaling_factor = float("nan")
+        spx_value = float("nan")
+    else:
+        initial_price = bench["Close"].dropna().iloc[0].item()
+        price_now = bench["Close"].dropna().iloc[-1].item()
+        scaling_factor = 100 / initial_price
+        spx_value = price_now * scaling_factor
     print(f"$100 Invested in the S&P 500: ${spx_value:.2f}")
     print("today's portfolio:")
     print(chatgpt_portfolio)
