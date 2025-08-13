@@ -8,7 +8,7 @@ on:
       - "requirements.txt"
       - ".github/workflows/trader.yml"
   # schedule:
-  #   - cron: "32 13 * * 1-5"  # ex: 13:32 UTC les jours de bourse
+  #   - cron: "32 13 * * 1-5"  # ex: 13:32 UTC jours ouvrés
 
 permissions:
   contents: write
@@ -24,6 +24,7 @@ jobs:
 
     env:
       TZ: America/New_York
+      PYTHONUNBUFFERED: "1"
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
@@ -57,9 +58,7 @@ jobs:
       - name: Quick diagnostics
         run: |
           echo "PWD: $(pwd)"
-          echo "Repo files:"
           ls -al
-          echo "Python:"
           python --version
           python - <<'PY'
           import sys, os
@@ -89,12 +88,30 @@ jobs:
           print(json.dumps(subset, indent=2))
           PY
 
-      - name: Run trader (Paper) + capture logs and paper state
+      - name: Discover script CLI & logging hooks
         run: |
           set -Eeuo pipefail
-          echo "--- START $(date -Is) ---" | tee run.log
-          echo "EXECUTE_PAPER=${EXECUTE_PAPER}" | tee -a run.log
+          echo "--- DISCOVERY $(date -Is) ---" | tee run.log
+          echo "---- trading_script.py --help ----" | tee -a run.log
+          set +e
+          python trading_script.py --help 2>&1 | tee -a run.log
+          HELP_EXIT=${PIPESTATUS[0]}
+          set -e
+          echo "---- help exit=${HELP_EXIT} ----" | tee -a run.log
 
+          echo "---- grep argparse ----" | tee -a run.log
+          grep -nE 'ArgumentParser\(|add_argument\(' trading_script.py | head -n 80 | tee -a run.log || echo "(no argparse hits)" | tee -a run.log
+
+          echo "---- grep logging ----" | tee -a run.log
+          grep -nE 'import +logging|logging\.basicConfig|logging\.(info|debug|warning|error|critical)\(' trading_script.py | head -n 80 | tee -a run.log || echo "(no logging hits)" | tee -a run.log
+
+          echo "---- grep Alpaca env usage ----" | tee -a run.log
+          grep -nE 'APCA_|ALPACA_' trading_script.py | head -n 80 | tee -a run.log || echo "(no Alpaca env hits)" | tee -a run.log
+
+      - name: Run trader (Paper) with logging injection
+        run: |
+          set -Eeuo pipefail
+          echo "--- RUN $(date -Is) ---" | tee -a run.log
           PAPER_URL="https://paper-api.alpaca.markets"
 
           echo "---- Alpaca clock (paper) ----" | tee -a run.log
@@ -105,22 +122,42 @@ jobs:
             | jq -r '"is_open=\(.is_open) next_open=\(.next_open) next_close=\(.next_close)"' \
             | tee -a run.log || true
 
-          if [[ "${EXECUTE_PAPER}" == "true" ]]; then
-            echo "[RUN] Paper trading ON" | tee -a run.log
-            export APCA_API_BASE_URL="${PAPER_URL}"
-            set +e
-            python -u trading_script.py 2>&1 | tee -a run.log
-            PY_EXIT=${PIPESTATUS[0]}
-            set -e
-          else
-            echo "[RUN] Dry-run (no orders sent)" | tee -a run.log
-            set +e
-            python -u trading_script.py --dry-run 2>&1 | tee -a run.log
-            PY_EXIT=${PIPESTATUS[0]}
-            set -e
-          fi
+          echo "[RUN] Paper trading ON" | tee -a run.log
+          export APCA_API_BASE_URL="${PAPER_URL}"
+
+          # Injection logging + exécution du script en unbuffered
+          set +e
+          python -u - <<'PY' 2>&1 | tee -a run.log
+          import os, sys, logging, runpy
+          # Logging vers stdout (si le script ne configure rien, on a un fallback)
+          logging.basicConfig(
+              level=logging.INFO,
+              format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+              stream=sys.stdout
+          )
+          os.environ.setdefault("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+          try:
+              runpy.run_path("trading_script.py", run_name="__main__")
+          except SystemExit as e:
+              # Propager le code de sortie si le script appelle sys.exit()
+              code = e.code if isinstance(e.code, int) else 0
+              raise SystemExit(code)
+          PY
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
 
           echo "---- python exit=${PY_EXIT} ----" | tee -a run.log
+
+          echo "---- Collect local *.log (tail 200) ----" | tee -a run.log
+          found=0
+          for f in *.log; do
+            if [ -f "$f" ] && [ "$f" != "run.log" ]; then
+              found=1
+              echo "----- $f -----" | tee -a run.log
+              tail -n 200 "$f" | tee -a run.log || true
+            fi
+          done
+          [ $found -eq 0 ] && echo "(no extra .log files)" | tee -a run.log
 
           echo "---- Verify recent Alpaca orders (Paper, last 5) ----" | tee -a run.log
           curl -s \
@@ -129,9 +166,7 @@ jobs:
             "${PAPER_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_paper.json || echo "[]" > alpaca_orders_paper.json
           jq -r 'if type=="array" and length>0 then
                     .[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"
-                 else
-                    "[]"
-                 end' alpaca_orders_paper.json | tee -a run.log || true
+                 else "[]" end' alpaca_orders_paper.json | tee -a run.log || true
 
           echo "---- Positions (Paper) ----" | tee -a run.log
           curl -s \
@@ -140,9 +175,7 @@ jobs:
             "${PAPER_URL}/v2/positions" > alpaca_positions_paper.json || echo "[]" > alpaca_positions_paper.json
           jq -r 'if type=="array" and length>0 then
                     .[] | "\(.symbol) qty=\(.qty) avg_entry=\(.avg_entry_price)"
-                 else
-                    "[]"
-                 end' alpaca_positions_paper.json | tee -a run.log || true
+                 else "[]" end' alpaca_positions_paper.json | tee -a run.log || true
 
           echo "---- Activities FILL (Paper, recent) ----" | tee -a run.log
           curl -s \
@@ -151,33 +184,31 @@ jobs:
             "${PAPER_URL}/v2/account/activities?activity_types=FILL&direction=desc&page_size=25" > activities_paper.json || echo "[]" > activities_paper.json
           jq -r 'if type=="array" and length>0 then
                     .[] | "\(.transaction_time // "?") \(.symbol // "?") \(.side // "?") qty=\(.qty // "?") price=\(.price // "?")"
-                 else
-                    "[]"
-                 end' activities_paper.json | tee -a run.log || true
+                 else "[]" end' activities_paper.json | tee -a run.log || true
 
-          echo "--- END $(date -Is) ---" | tee -a run.log
-          # Fail the step if python failed
+          # Échouer le job si le script a renvoyé un code d'erreur
           test "${PY_EXIT}" -eq 0
 
-      - name: Upload artifacts (run.log + JSON)
+      - name: Upload artifacts (run.log + JSON + extra logs)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: trader-paper-${{ github.run_id }}
           path: |
             run.log
+            *.log
             alpaca_orders_paper.json
             alpaca_positions_paper.json
             activities_paper.json
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Commit & push JSON + run.log
+      - name: Commit & push logs/JSON
         if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add run.log alpaca_orders_paper.json alpaca_positions_paper.json activities_paper.json || true
+          git add run.log *.log alpaca_orders_paper.json alpaca_positions_paper.json activities_paper.json || true
           git commit -m "Auto run $(date -u +%F)" || echo "No changes"
           git pull --rebase || true
           git push || true
