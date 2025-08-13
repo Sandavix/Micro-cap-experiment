@@ -1,10 +1,9 @@
-name: Trader Paper (avec X-Ray)
+name: Portfolio Trader (X-Ray)
 
 on:
   workflow_dispatch: {}
-  # Active un run programmé si besoin :
   # schedule:
-  #   - cron: "30 13 * * 1-5"  # 13:30 UTC ~ 09:30 ET (à ajuster)
+  #   - cron: "30 13 * * 1-5"   # 13:30 UTC ≈ 09:30 ET
 
 jobs:
   run:
@@ -54,14 +53,14 @@ jobs:
           echo "Python:" | tee -a run.log
           python --version | tee -a run.log
           python - <<'PY' | tee -a run.log
-import sys, os
-print("sys.executable:", sys.executable)
-print("sys.path[0:3]:", sys.path[:3])
-f = "trading_script.py"
-print("trading_script.py exists:", os.path.exists(f))
-if os.path.exists(f):
-    print("size(bytes):", os.path.getsize(f))
-PY
+          import sys, os
+          print("sys.executable:", sys.executable)
+          print("sys.path[0:3]:", sys.path[:3])
+          f = "trading_script.py"
+          print("trading_script.py exists:", os.path.exists(f))
+          if os.path.exists(f):
+              print("size(bytes):", os.path.getsize(f))
+          PY
 
       - name: Sanity Alpaca /v2/account
         shell: bash
@@ -70,23 +69,23 @@ PY
         run: |
           echo "---- Alpaca account subset ----" | tee -a run.log
           python - <<'PY' | tee -a run.log
-import os, json, urllib.request
-base = os.environ.get('BASE','https://paper-api.alpaca.markets')
-req = urllib.request.Request(
-    f"{base}/v2/account",
-    headers={
-        "APCA-API-KEY-ID": os.environ["APCA_API_KEY_ID"],
-        "APCA-API-SECRET-KEY": os.environ["APCA_API_SECRET_KEY"],
-    }
-)
-with urllib.request.urlopen(req, timeout=20) as r:
-    data = json.loads(r.read().decode())
-subset = {k: data[k] for k in ("status","equity","cash","buying_power","pattern_day_trader","trading_blocked")}
-print(json.dumps(subset, indent=2))
-PY
+          import os, json, urllib.request
+          base = os.environ.get('BASE','https://paper-api.alpaca.markets')
+          req = urllib.request.Request(
+              f"{base}/v2/account",
+              headers={
+                  "APCA-API-KEY-ID": os.environ["APCA_API_KEY_ID"],
+                  "APCA-API-SECRET-KEY": os.environ["APCA_API_SECRET_KEY"],
+              }
+          )
+          with urllib.request.urlopen(req, timeout=20) as r:
+              data = json.loads(r.read().decode())
+          subset = {k: data[k] for k in ("status","equity","cash","buying_power","pattern_day_trader","trading_blocked")}
+          print(json.dumps(subset, indent=2))
+          PY
 
       # -------------------------
-      #         X-RAY
+      #           X-RAY
       # -------------------------
       - name: X-RAY — Inspect structure & greps
         shell: bash
@@ -95,26 +94,28 @@ PY
           nl -ba trading_script.py | sed -n '1,120p' | tee -a run.log || true
           echo "---- X-RAY: LAST 120 LINES ----" | tee -a run.log
           nl -ba trading_script.py | tail -n 120 | tee -a run.log || true
-
           echo "---- X-RAY: QUICK GREPS ----" | tee -a run.log
           (grep -nE 'def +main|if +__name__|place|order|submit_order|requests\.post|requests\.get|APCA_|ALPACA_|os\.getenv|datetime|time\.sleep|schedule' trading_script.py || echo "(no hits)") | tee -a run.log
 
+      - name: X-RAY — AST summary
+        shell: bash
+        run: |
           echo "---- X-RAY: AST SUMMARY ----" | tee -a run.log
           python - <<'PY' | tee -a run.log
-import ast, pathlib
-p = pathlib.Path("trading_script.py")
-t = ast.parse(p.read_text(encoding="utf-8"))
-funcs = sorted({n.name for n in ast.walk(t) if isinstance(n, ast.FunctionDef)})
-consts = []
-for n in t.body:
-    if isinstance(n, ast.Assign) and all(getattr(tgt,'id',None) for tgt in n.targets):
-        v = n.value
-        if isinstance(v, ast.Constant):
-            for tgt in n.targets:
-                consts.append((tgt.id, v.value))
-print("FUNCTIONS:", funcs)
-print("TOP_LEVEL_CONSTANTS (sample):", consts[:30])
-PY
+          import ast, pathlib
+          p = pathlib.Path("trading_script.py")
+          t = ast.parse(p.read_text(encoding="utf-8"))
+          funcs = sorted({n.name for n in ast.walk(t) if isinstance(n, ast.FunctionDef)})
+          consts = []
+          for n in t.body:
+              if isinstance(n, ast.Assign) and all(getattr(tgt,'id',None) for tgt in n.targets):
+                  v = n.value
+                  if isinstance(v, ast.Constant):
+                      for tgt in n.targets:
+                          consts.append((tgt.id, v.value))
+          print("FUNCTIONS:", funcs)
+          print("TOP_LEVEL_CONSTANTS (sample):", consts[:30])
+          PY
 
       - name: X-RAY — Trace first ~300 executed lines
         shell: bash
@@ -127,7 +128,7 @@ PY
           echo "---- xray exit=${XRAY_EXIT} ----" | tee -a run.log
 
       # -------------------------
-      #        RUN NORMAL
+      #           RUN
       # -------------------------
       - name: Run trader (paper)
         shell: bash
@@ -144,20 +145,12 @@ PY
             | jq -r '"is_open=\(.is_open) next_open=\(.next_open) next_close=\(.next_close)"' \
             | tee -a run.log || true
 
-          if [[ "${EXECUTE_PAPER}" == "true" ]]; then
-            echo "[RUN] Paper trading ON" | tee -a run.log
-            export APCA_API_BASE_URL="${PAPER_URL}"
-            set +e
-            python -u trading_script.py 2>&1 | tee -a run.log
-            PY_EXIT=${PIPESTATUS[0]}
-            set -e
-          else
-            echo "[RUN] Dry-run (no orders sent)" | tee -a run.log
-            set +e
-            python -u trading_script.py --dry-run 2>&1 | tee -a run.log
-            PY_EXIT=${PIPESTATUS[0]}
-            set -e
-          fi
+          echo "[RUN] Paper trading ON" | tee -a run.log
+          export APCA_API_BASE_URL="${PAPER_URL}"
+          set +e
+          python -u trading_script.py 2>&1 | tee -a run.log
+          PY_EXIT=${PIPESTATUS[0]}
+          set -e
 
           echo "---- python exit=${PY_EXIT} ----" | tee -a run.log
 
@@ -189,8 +182,6 @@ PY
                  else "[]" end' activities_paper.json | tee -a run.log || true
 
           echo "--- END $(date -Is) ---" | tee -a run.log
-
-          # Échouer le job si le script a échoué
           test "${PY_EXIT}" -eq 0
 
       - name: Upload artifacts (logs + json + script)
