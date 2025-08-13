@@ -34,17 +34,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # --- Bloc corrigé : Debunk Error (run & verify) ---
+      # --- Bloc : Debunk Error (run & verify) ---
       - name: Debunk Error (run & verify)
         env:
-          # On respecte ta variable repo existante (casse incluse)
-          EXECUTE_PAPER: ${{ vars.executePaper }}
+          # Normalise le nom de variable côté GitHub (on couvre plusieurs variantes)
+          EXECUTE_PAPER: ${{ vars.executePaper || vars.EXECUTE_PAPER || vars.EXECUTEPAPER || 'false' }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: |
           set -Eeuo pipefail
 
-          echo "executePaper=${EXECUTE_PAPER}"
+          echo "EXECUTE_PAPER=${EXECUTE_PAPER}"
           python --version
 
           # --- Run trading script (comme Nathan) ---
