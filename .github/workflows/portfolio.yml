@@ -1,57 +1,124 @@
 name: portfolio-bot
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: '35 13 * * 1-5'  # 13:35 UTC ≈ 15:35 à Vevey (été)
+    - cron: "35 13 * * 1-5"   # 13:35 UTC = 15:35 à Vevey (été)
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: portfolio-bot
+  cancel-in-progress: true
+
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      EXECUTE_PAPER: ${{ vars.EXECUTE_PAPER || 'false' }}
+      EXECUTE_PAPER: ${{ vars.EXECUTE_PAPER || 'false' }}  # OFF par défaut
       ALPACA_BASE_URL: https://paper-api.alpaca.markets
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: python -m pip install --upgrade pip
-      - run: pip install -r requirements.txt
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      # Lance le script de Nathan. Ajuste le chemin selon l'endroit où il est dans TON dépôt importé.
-      - name: Generate plan / decisions
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # --- Génération/validation (ne place pas d'ordres) ---
+      - name: Dry run (plan only)
         run: |
           if [ -f "trading_script.py" ]; then
-            python trading_script.py --dry-run
+            python -u trading_script.py --dry-run
           elif [ -f "Scripts and CSV Files/trading_script.py" ]; then
-            python "Scripts and CSV Files/trading_script.py" --dry-run
+            python -u "Scripts and CSV Files/trading_script.py" --dry-run
           else
             echo "trading_script.py introuvable"; exit 1
           fi
 
-      # Si tu veux commit les fichiers générés (CSV/logs/graphs) :
-      - name: Commit outputs
+      - name: Debug plan (count + aperçu)
+        run: |
+          set -e
+          D=$(date -u +%F)
+          if [ -f "plans/plan_${D}.json" ]; then
+            echo "Plan JSON trouvé: plans/plan_${D}.json"
+            python - <<'PY'
+import json, os
+p=f"plans/plan_{os.popen('date -u +%F').read().strip()}.json"
+d=json.load(open(p))
+print("Decision count:", len(d.get("decisions",[])))
+for r in d.get("decisions",[])[:3]:
+    print(r)
+PY
+          elif [ -f "plans/plan_${D}.csv" ]; then
+            echo "Plan CSV trouvé: plans/plan_${D}.csv"
+            cnt=$(($(wc -l < "plans/plan_${D}.csv")-1))
+            echo "Decision count: $cnt"
+            head -n 5 "plans/plan_${D}.csv" || true
+          else
+            echo "Aucun plan trouvé pour ${D}"
+          fi
+
+      - name: Commit plan snapshot (optional)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add . || true
-          git commit -m "Auto run $(date -u +%F)" || echo "No changes"
+          git add plans/ || true
+          git commit -m "Plan snapshot $(date -u +%F)" || echo "No changes"
           git push || true
 
-      # Si tu veux passer des ordres réels en Paper, enlève --dry-run et garde ce garde-fou :
+      # --- Exécution conditionnelle ---
+      - name: Debug EXECUTE_PAPER
+        run: echo "EXECUTE_PAPER=$EXECUTE_PAPER"
+
       - name: Execute on Alpaca (Paper)
         if: env.EXECUTE_PAPER == 'true'
         run: |
           if [ -f "trading_script.py" ]; then
-            python trading_script.py
+            python -u trading_script.py
           elif [ -f "Scripts and CSV Files/trading_script.py" ]; then
-            python "Scripts and CSV Files/trading_script.py"
+            python -u "Scripts and CSV Files/trading_script.py"
+          else
+            echo "trading_script.py introuvable"; exit 1
           fi
+
+      - name: Show last 3 Alpaca orders (Paper)
+        if: env.EXECUTE_PAPER == 'true'
+        run: |
+          curl -s "$ALPACA_BASE_URL/v2/orders?status=all&limit=3" \
+            -H "APCA-API-KEY-ID: $ALPACA_API_KEY" \
+            -H "APCA-API-SECRET-KEY: $ALPACA_SECRET_KEY" | python - <<'PY'
+import sys, json
+try:
+    data=json.load(sys.stdin)
+    orders=data.get('orders', data)  # compat formats
+    if not orders:
+        print("Aucun ordre récent (Paper).")
+    else:
+        for o in orders[:3]:
+            print(o.get("submitted_at"), o.get("symbol"), o.get("side"),
+                  o.get("qty"), o.get("type"), o.get("status"))
+except Exception as e:
+    print("Impossible de lire la réponse Alpaca:", e)
+PY
+
+      - name: Upload plans as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plans-${{ github.run_id }}
+          path: plans/
+          if-no-files-found: ignore
