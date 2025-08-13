@@ -2,7 +2,7 @@ name: portfolio-bot
 
 on:
   schedule:
-    - cron: "35 13 * * 1-5"   # 13:35 UTC = 15:35 à Vevey (été)
+    - cron: "35 13 * * 1-5"   # 13:35 UTC = 15:35 Vevey (été)
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      EXECUTE_PAPER: ${{ vars.EXECUTE_PAPER || 'false' }}  # OFF par défaut
+      EXECUTE_PAPER: ${{ vars.EXECUTE_PAPER || 'false' }}
       ALPACA_BASE_URL: https://paper-api.alpaca.markets
       PYTHONUNBUFFERED: "1"
 
@@ -38,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # --- Génération/validation (ne place pas d'ordres) ---
+      # --- Génération/validation ---
       - name: Dry run (plan only)
         run: |
           if [ -f "trading_script.py" ]; then
@@ -59,13 +59,13 @@ jobs:
 import json, os
 p=f"plans/plan_{os.popen('date -u +%F').read().strip()}.json"
 d=json.load(open(p))
-print("Decision count:", len(d.get("decisions",[])))
-for r in d.get("decisions",[])[:3]:
+print("Decision count:", len(d.get("decisions", [])))
+for r in d.get("decisions", [])[:3]:
     print(r)
 PY
           elif [ -f "plans/plan_${D}.csv" ]; then
             echo "Plan CSV trouvé: plans/plan_${D}.csv"
-            cnt=$(($(wc -l < "plans/plan_${D}.csv")-1))
+            cnt=$(( $(wc -l < "plans/plan_${D}.csv") - 1 ))
             echo "Decision count: $cnt"
             head -n 5 "plans/plan_${D}.csv" || true
           else
@@ -104,7 +104,7 @@ PY
 import sys, json
 try:
     data=json.load(sys.stdin)
-    orders=data.get('orders', data)  # compat formats
+    orders=data.get('orders', data)
     if not orders:
         print("Aucun ordre récent (Paper).")
     else:
