@@ -44,38 +44,51 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          echo "EXECUTE_PAPER=${EXECUTE_PAPER}"
-          python --version
-
-          # --- Run trading script (comme Nathan) ---
-          if [[ "${EXECUTE_PAPER}" == "true" ]]; then
-            echo "[RUN] Paper trading ON"
-            python trading_script.py | tee run.log
-          else
-            echo "[RUN] Dry-run (no orders sent)"
-            python trading_script.py --dry-run | tee run.log
-          fi
-
-          echo "---- tail run.log (last 200) ----"
-          tail -n 200 run.log || true
-
-          # --- Verify with Alpaca (did anything actually go out?) ---
-          echo "---- Verify recent Alpaca orders (last 5) ----"
-          BASE_URL="https://paper-api.alpaca.markets"
-          curl -s \
-            -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" \
-            -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
-            "${BASE_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders.json || echo "[]"
-
-          # jq est généralement présent, sinon on l'installe vite fait
+          # jq (pour parser les réponses Alpaca)
           if ! command -v jq >/dev/null 2>&1; then
             sudo apt-get update -y >/dev/null 2>&1 || true
             sudo apt-get install -y jq >/dev/null 2>&1 || true
           fi
 
-          COUNT=$(jq 'length' alpaca_orders.json 2>/dev/null || echo 0)
-          echo "[ALPACA] orders_returned=${COUNT}"
-          jq -r '.[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"' alpaca_orders.json || true
+          echo "EXECUTE_PAPER=${EXECUTE_PAPER}"
+          python --version
+
+          PAPER_URL="https://paper-api.alpaca.markets"
+          LIVE_URL="https://api.alpaca.markets"
+
+          echo "---- Alpaca clock (paper) ----"
+          curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
+            "${PAPER_URL}/v2/clock" | jq -r '"is_open=\(.is_open) next_open=\(.next_open) next_close=\(.next_close)"' || true
+
+          # --- Run trading script (comme Nathan) ---
+          if [[ "${EXECUTE_PAPER}" == "true" ]]; then
+            echo "[RUN] Paper trading ON"
+            export APCA_API_BASE_URL="${PAPER_URL}"   # force l'SDK sur Paper
+            python -u trading_script.py | tee run.log
+          else
+            echo "[RUN] Dry-run (no orders sent)"
+            python -u trading_script.py --dry-run | tee run.log
+          fi
+
+          echo "---- run.log stats ----"
+          test -f run.log && { echo "bytes=$(wc -c < run.log)  lines=$(wc -l < run.log)"; } || echo "run.log missing"
+          echo "---- tail run.log (last 200) ----"
+          tail -n 200 run.log || true
+
+          # --- Verify with Alpaca (did anything actually go out?) ---
+          echo "---- Verify recent Alpaca orders (Paper, last 5) ----"
+          curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
+            "${PAPER_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_paper.json || echo "[]"
+          COUNT_PAPER=$(jq 'length' alpaca_orders_paper.json 2>/dev/null || echo 0)
+          echo "[ALPACA/PAPER] orders_returned=${COUNT_PAPER}"
+          jq -r '.[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"' alpaca_orders_paper.json || true
+
+          echo "---- Verify recent Alpaca orders (Live, last 5) ----"
+          curl -s -H "APCA-API-KEY-ID: ${ALPACA_API_KEY}" -H "APCA-API-SECRET-KEY: ${ALPACA_SECRET_KEY}" \
+            "${LIVE_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_live.json || echo "[]"
+          COUNT_LIVE=$(jq 'length' alpaca_orders_live.json 2>/dev/null || echo 0)
+          echo "[ALPACA/LIVE] orders_returned=${COUNT_LIVE}"
+          jq -r '.[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")"' alpaca_orders_live.json || true
 
       - name: Commit outputs
         if: always()
