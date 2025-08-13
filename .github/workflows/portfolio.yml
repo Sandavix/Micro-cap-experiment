@@ -1,238 +1,50 @@
-name: Portfolio Trader (X-Ray)
+name: Portfolio
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+  push:
+    branches: [ main ]
   # schedule:
-  #   - cron: "30 13 * * 1-5"   # 13:30 UTC ≈ 09:30 ET
+  #   - cron: "30 20 * * 1-5"  # (ex) tous les jours ouvrés à 20:30 UTC
 
 jobs:
   run:
-    runs-on: ubuntu-24.04
-
-    env:
-      TZ: America/New_York
-      PYTHONUNBUFFERED: "1"
-
-      # Secrets principaux (peuvent être vides si non définis dans le repo)
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
-      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-      APCA_API_KEY_ID: ${{ secrets.APCA_API_KEY_ID }}
-      APCA_API_SECRET_KEY: ${{ secrets.APCA_API_SECRET_KEY }}
-
-      APCA_API_BASE_URL: https://paper-api.alpaca.markets
-      EXECUTE_PAPER: "true"
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          cache: "pip"
 
       - name: Install deps
-        shell: bash
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Ensure jq
-        shell: bash
-        run: |
-          if ! command -v jq >/dev/null 2>&1; then
-            sudo apt-get update -y >/dev/null 2>&1 || true
-            sudo apt-get install -y jq >/dev/null 2>&1 || true
-          fi
-
-      - name: Repo & Python info
-        shell: bash
-        run: |
-          echo "--- INFO $(date -Is) ---" | tee run.log
-          echo "PWD: $(pwd)" | tee -a run.log
-          ls -al | tee -a run.log
-          echo "Python:" | tee -a run.log
-          python --version | tee -a run.log
-          python - <<'PY' | tee -a run.log
-          import sys, os
-          print("sys.executable:", sys.executable)
-          print("sys.path[0:3]:", sys.path[:3])
-          f = "trading_script.py"
-          print("trading_script.py exists:", os.path.exists(f))
-          if os.path.exists(f):
-              print("size(bytes):", os.path.getsize(f))
-          PY
-
-      # --- SANITY: ne casse pas le job si secrets manquants / 403 ---
-      - name: Sanity Alpaca /v2/account (skip-safe)
-        shell: bash
-        env:
-          BASE: ${{ env.APCA_API_BASE_URL }}
-        run: |
-          echo "---- Alpaca account subset ----" | tee -a run.log
-          python - <<'PY' | tee -a run.log
-          import os, json, urllib.request, urllib.error, sys
-          base = os.environ.get('BASE','https://paper-api.alpaca.markets')
-
-          # Fallback: APCA_* -> ALPACA_* si vide
-          key_id = os.environ.get("APCA_API_KEY_ID") or os.environ.get("ALPACA_API_KEY")
-          secret = os.environ.get("APCA_API_SECRET_KEY") or os.environ.get("ALPACA_SECRET_KEY")
-
-          if not key_id or not secret:
-              print("Skipping sanity: missing Alpaca credentials (APCA_* and ALPACA_* not set).")
-              sys.exit(0)
-
-          req = urllib.request.Request(
-              f"{base}/v2/account",
-              headers={
-                  "APCA-API-KEY-ID": key_id,
-                  "APCA-API-SECRET-KEY": secret,
-              }
-          )
-          try:
-              with urllib.request.urlopen(req, timeout=20) as r:
-                  data = json.loads(r.read().decode())
-              subset = {k: data.get(k) for k in ("status","equity","cash","buying_power","pattern_day_trader","trading_blocked")}
-              print(json.dumps(subset, indent=2))
-          except urllib.error.HTTPError as e:
-              # Ne pas faire échouer le job : on logue et on continue
-              print(f"Sanity request failed: HTTP {e.code} — continuing. (Keys present? {bool(key_id) and bool(secret)})")
-              sys.exit(0)
-          PY
-
-      # -------------------------
-      #           X-RAY
-      # -------------------------
-      - name: X-RAY — Inspect structure & greps
-        shell: bash
-        run: |
-          echo "---- X-RAY: FIRST 120 LINES ----" | tee -a run.log
-          nl -ba trading_script.py | sed -n '1,120p' | tee -a run.log || true
-          echo "---- X-RAY: LAST 120 LINES ----" | tee -a run.log
-          nl -ba trading_script.py | tail -n 120 | tee -a run.log || true
-          echo "---- X-RAY: QUICK GREPS ----" | tee -a run.log
-          (grep -nE 'def +main|if +__name__|place|order|submit_order|requests\.post|requests\.get|APCA_|ALPACA_|os\.getenv|datetime|time\.sleep|schedule' trading_script.py || echo "(no hits)") | tee -a run.log
-
-      - name: X-RAY — AST summary
-        shell: bash
-        run: |
-          echo "---- X-RAY: AST SUMMARY ----" | tee -a run.log
-          python - <<'PY' | tee -a run.log
-          import ast, pathlib
-          p = pathlib.Path("trading_script.py")
-          t = ast.parse(p.read_text(encoding="utf-8"))
-          funcs = sorted({n.name for n in ast.walk(t) if isinstance(n, ast.FunctionDef)})
-          consts = []
-          for n in t.body:
-              if isinstance(n, ast.Assign) and all(getattr(tgt,'id',None) for tgt in n.targets):
-                  v = n.value
-                  if isinstance(v, ast.Constant):
-                      for tgt in n.targets:
-                          consts.append((tgt.id, v.value))
-          print("FUNCTIONS:", funcs)
-          print("TOP_LEVEL_CONSTANTS (sample):", consts[:30])
-          PY
-
-      - name: X-RAY — Trace first ~300 executed lines
-        shell: bash
-        run: |
-          echo "---- X-RAY: python -m trace --trace trading_script.py (head -n 300) ----" | tee -a run.log
-          set +e
-          python -m trace --trace trading_script.py | head -n 300 | tee -a run.log
-          XRAY_EXIT=${PIPESTATUS[0]}
-          set -e
-          echo "---- xray exit=${XRAY_EXIT} ----" | tee -a run.log
-
-      # -------------------------
-      #           RUN
-      # -------------------------
-      - name: Run trader (paper)
-        shell: bash
-        env:
-          PAPER_URL: https://paper-api.alpaca.markets
-        run: |
-          set -Eeuo pipefail
-          echo "--- RUN $(date -Is) ---" | tee -a run.log
-
-          # Fallback credentials: APCA_* -> ALPACA_*
-          KEY_ID="${APCA_API_KEY_ID:-${ALPACA_API_KEY:-}}"
-          SECRET="${APCA_API_SECRET_KEY:-${ALPACA_SECRET_KEY:-}}"
-
-          if [ -n "$KEY_ID" ] && [ -n "$SECRET" ]; then
-            echo "---- Alpaca clock (paper) ----" | tee -a run.log
-            curl -s \
-              -H "APCA-API-KEY-ID: ${KEY_ID}" \
-              -H "APCA-API-SECRET-KEY: ${SECRET}" \
-              "${PAPER_URL}/v2/clock" \
-              | jq -r '"is_open=\(.is_open) next_open=\(.next_open) next_close=\(.next_close)"' \
-              | tee -a run.log || true
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
           else
-            echo "[WARN] Skipping Alpaca /v2/clock: no credentials (APCA_* and ALPACA_* empty)." | tee -a run.log
+            pip install -q --upgrade pip
+            # fallback minimal si pas de requirements.txt
+            pip install pandas
           fi
 
-          echo "[RUN] Paper trading ON" | tee -a run.log
-          export APCA_API_BASE_URL="${PAPER_URL}"
+      - name: Run trading script (non-interactive)
+        shell: bash
+        run: |
+          python -u trading_script.py \
+            -f "Scripts and CSV Files/chatgpt_portfolio_update.csv" \
+            -d "Scripts and CSV Files" \
+            --non-interactive
 
-          set +e
-          python -u trading_script.py 2>&1 | tee -a run.log
-          PY_EXIT=${PIPESTATUS[0]}
-          set -e
-          echo "---- python exit=${PY_EXIT} ----" | tee -a run.log
-
-          if [ -n "$KEY_ID" ] && [ -n "$SECRET" ]; then
-            echo "---- Verify recent Alpaca orders (Paper, last 5) ----" | tee -a run.log
-            curl -s \
-              -H "APCA-API-KEY-ID: ${KEY_ID}" \
-              -H "APCA-API-SECRET-KEY: ${SECRET}" \
-              "${PAPER_URL}/v2/orders?status=all&limit=5&direction=desc" > alpaca_orders_paper.json || echo "[]" > alpaca_orders_paper.json
-            jq -r 'if type=="array" and length>0 then .[] | "\(.submitted_at // "?")  \(.symbol // "?")  \(.side // "?")  qty=\(.qty // "?")  status=\(.status // "?")  id=\(.id // "?")" else "[]" end' alpaca_orders_paper.json | tee -a run.log || true
-
-            echo "---- Positions (Paper) ----" | tee -a run.log
-            curl -s \
-              -H "APCA-API-KEY-ID: ${KEY_ID}" \
-              -H "APCA-API-SECRET-KEY: ${SECRET}" \
-              "${PAPER_URL}/v2/positions" > alpaca_positions_paper.json || echo "[]" > alpaca_positions_paper.json
-            jq -r 'if type=="array" and length>0 then .[] | "\(.symbol) qty=\(.qty) avg_entry=\(.avg_entry_price)" else "[]" end' alpaca_positions_paper.json | tee -a run.log || true
-
-            echo "---- Activities FILL (Paper, recent) ----" | tee -a run.log
-            curl -s \
-              -H "APCA-API-KEY-ID: ${KEY_ID}" \
-              -H "APCA-API-SECRET-KEY: ${SECRET}" \
-              "${PAPER_URL}/v2/account/activities?activity_types=FILL&direction=desc&page_size=25" > activities_paper.json || echo "[]" > activities_paper.json
-            jq -r 'if type=="array" and length>0 then .[] | "\(.transaction_time // "?") \(.symbol // "?") \(.side // "?") qty=\(.qty // "?") price=\(.price // "?")" else "[]" end' activities_paper.json | tee -a run.log || true
-          else
-            echo "[WARN] Skipping post-run Alpaca checks: no credentials." | tee -a run.log
-            echo "[]" > alpaca_orders_paper.json
-            echo "[]" > alpaca_positions_paper.json
-            echo "[]" > activities_paper.json
-          fi
-
-          echo "--- END $(date -Is) ---" | tee -a run.log
-          test "${PY_EXIT}" -eq 0
-
-      - name: Upload artifacts (logs + json + script)
+      # (facultatif) Publier les fichiers mis à jour comme artefacts
+      - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: trader-paper-xray-${{ github.run_id }}
+          name: portfolio-outputs
           path: |
-            run.log
-            *.log
-            alpaca_orders_paper.json
-            alpaca_positions_paper.json
-            activities_paper.json
-            trading_script.py
-          retention-days: 7
-          if-no-files-found: warn
-
-      - name: Commit logs back to repo (optional)
-        if: ${{ github.ref == 'refs/heads/main' }}
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add run.log *.log alpaca_orders_paper.json alpaca_positions_paper.json activities_paper.json || true
-          git commit -m "Auto run $(date -u +%F)" || echo "No changes"
-          git pull --rebase || true
-          git push || true
+            Scripts and CSV Files/chatgpt_portfolio_update.csv
+            Scripts and CSV Files/chatgpt_trade_log.csv
