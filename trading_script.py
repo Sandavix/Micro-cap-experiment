@@ -11,12 +11,54 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# --- Robust market data helpers (retry + fallbacks) ---
+def robust_history(symbol: str, days: int | None = 5, start=None, end=None) -> pd.DataFrame:
+    """
+    Try hard to fetch price history for `symbol` using yfinance.
+    - Retries with backoff to avoid transient Yahoo! errors.
+    - If `start`/`end` are provided, uses that window; else uses `days` period.
+    - Falls back to fast_info last price (single-row DataFrame) if history fails.
+    Always returns a DataFrame with at least a 'Close' column, or an empty DataFrame on failure.
+    """
+    import yfinance as yf
+    import pandas as pd
+    import time
+
+    attempts = 4
+    for i in range(attempts):
+        try:
+            if start is not None or end is not None:
+                df = yf.download(symbol, start=start, end=end, progress=False, threads=False)
+            else:
+                period = f"{max(days,1)}d" if days else "5d"
+                df = yf.download(symbol, period=period, progress=False, threads=False)
+            if df is not None and not df.empty:
+                # yfinance returns a MultiIndex for multiple tickers; ensure single-level
+                if isinstance(df.columns, pd.MultiIndex):
+                    # pick the first level if needed
+                    if 'Close' in df.columns.get_level_values(0):
+                        df = df['Close'].to_frame()
+                        df.columns = ['Close']
+                return df
+        except Exception as e:
+            # Swallow and retry after a short backoff
+            time.sleep(1.5 * (i + 1))
+
+    # Fallback: try fast_info (different endpoint)
+    try:
+        fi = yf.Ticker(symbol).fast_info
+        p = fi.get("last_price") or fi.get("last") or fi.get("regular_market_price")
+        if p is not None:
+            return pd.DataFrame({"Close": [float(p)]})
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+import time
 from typing import Any, cast
 import os
 import time
-import sys
-import argparse
-
 
 # Shared file locations
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -147,7 +189,7 @@ Would you like to log a manual trade? Enter 'b' for buy, 's' for sell, or press 
         cost = stock["buy_price"]
         cost_basis = stock["cost_basis"]
         stop = stock["stop_loss"]
-        data = yf.Ticker(ticker).history(period="1d")
+        data = robust_history(ticker, days=5)
 
         if data.empty:
             print(f"No data for {ticker}")
@@ -524,26 +566,20 @@ def daily_results(chatgpt_portfolio: pd.DataFrame, cash: float) -> None:
     print(f"Latest ChatGPT Equity: ${final_equity:.2f}")
     # Get S&P 500 data
     final_date = totals.loc[totals.index[-1], "Date"]
-    bench = yf.download("^GSPC", start="2025-06-27", end=final_date + pd.Timedelta(days=1), progress=False)
-    bench = cast(pd.DataFrame, bench).reset_index()
-
-    # Fallback to SPY if ^GSPC fails or is empty
-    if bench.empty or "Close" not in bench:
-        fallback = yf.download("SPY", start="2025-06-27", end=final_date + pd.Timedelta(days=1), progress=False)
-        bench = cast(pd.DataFrame, fallback).reset_index()
-
-    # Normalize to $100 (guard for empty frame)
-    if bench.empty or "Close" not in bench or bench["Close"].dropna().empty:
-        initial_price = float("nan")
-        price_now = float("nan")
-        scaling_factor = float("nan")
-        spx_value = float("nan")
-    else:
-        initial_price = bench["Close"].dropna().iloc[0].item()
-        price_now = bench["Close"].dropna().iloc[-1].item()
-        scaling_factor = 100 / initial_price
-        spx_value = price_now * scaling_factor
+    spx = pd.DataFrame()
+for __sym in ["^SPX", "^GSPC", "SPY", "IVV"]:
+    spx = robust_history(__sym, start="2025-06-27", end=final_date + pd.Timedelta(days=1))
+    if not spx.empty:
+        spx = spx.reset_index()
+        break
+if not spx.empty:
+    initial_price = float(spx["Close"].iloc[0])
+    price_now = float(spx["Close"].iloc[-1])
+    scaling_factor = 100 / initial_price
+    spx_value = price_now * scaling_factor
     print(f"$100 Invested in the S&P 500: ${spx_value:.2f}")
+else:
+    print("Could not fetch S&P 500 baseline (tried ^SPX,^GSPC,SPY,IVV).")
     print("today's portfolio:")
     print(chatgpt_portfolio)
     print(f"cash balance: {cash}")
@@ -622,38 +658,3 @@ def load_latest_portfolio_state(
     cash = float(latest["Cash Balance"])
     print(latest_tickers)
     return latest_tickers, cash
-
-# --- CLI entry point added to make the script runnable & CI-friendly ---
-def main(file: str, data_dir: Path | None = None, interactive: bool | None = None) -> None:
-    """Run the trading script."""
-    chatgpt_portfolio, cash = load_latest_portfolio_state(file)
-    if data_dir is not None:
-        set_data_dir(data_dir)
-
-    if interactive is None:
-        import sys as _sys, os as _os
-        interactive = not (
-            _os.environ.get("GITHUB_ACTIONS") == "true"
-            or _os.environ.get("CI") == "true"
-            or not _sys.stdin.isatty()
-        )
-
-    chatgpt_portfolio, cash = process_portfolio(chatgpt_portfolio, cash, interactive=interactive)
-    daily_results(chatgpt_portfolio, cash)
-
-if __name__ == "__main__":
-    import argparse as _argparse
-    parser = _argparse.ArgumentParser(description="Maintain/compute daily results for the ChatGPT micro-cap portfolio.")
-    parser.add_argument("-f", "--file", required=True,
-                        help="Path to the portfolio CSV containing historical records.")
-    parser.add_argument("-d", "--data-dir", default=None,
-                        help="Directory to write chatgpt_portfolio_update.csv and chatgpt_trade_log.csv")
-    ig = parser.add_mutually_exclusive_group()
-    ig.add_argument("--interactive", dest="interactive", action="store_true",
-                    help="Force prompts for manual trades.")
-    ig.add_argument("--non-interactive", dest="interactive", action="store_false",
-                    help="Disable prompts (useful for CI).")
-    parser.set_defaults(interactive=None)
-    args = parser.parse_args()
-
-    main(args.file, Path(args.data_dir) if args.data_dir else None, interactive=args.interactive)
