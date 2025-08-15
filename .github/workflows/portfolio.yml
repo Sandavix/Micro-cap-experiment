@@ -1,63 +1,57 @@
 name: run
 
 on:
-  workflow_dispatch: {}
-  # (optionnel) déclenchement auto les jours ouvrés à 16:30 UTC
+  workflow_dispatch:
+  # Décommente si tu veux un run auto (lun-ven 20:30 UTC par ex.)
   # schedule:
-  #   - cron: "30 16 * * 1-5"
-
-permissions:
-  contents: read
+  #   - cron: '30 20 * * 1-5'
 
 jobs:
   run:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install dependencies
-        shell: bash
+      - name: Install deps
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            # fallback minimal si pas de requirements.txt
-            pip install -q --upgrade pip
             pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4
           fi
 
-      # >>> Étape qui "seed" le CSV si vide / absent <<<
-      - name: Seed portfolio CSV if empty
-        shell: bash
+      - name: Ensure CSVs exist
         run: |
           mkdir -p "Scripts and CSV Files"
           FILE="Scripts and CSV Files/chatgpt_portfolio_update.csv"
           if [ ! -s "$FILE" ]; then
             echo 'Date,Cash,Equity,SPX_100,Holdings' > "$FILE"
-            # Choisis le cash de départ ici (100 par défaut)
+            # Cash/Equity de départ (modifie si besoin)
             echo "$(date -u +%F),100.00,100.00,,[]" >> "$FILE"
           fi
 
       - name: Run trading script (non-interactive)
-        shell: bash
         run: |
           python -u trading_script.py \
             -f "Scripts and CSV Files/chatgpt_portfolio_update.csv" \
             -d "Scripts and CSV Files" \
             --non-interactive
 
-      - name: Upload artifacts
+      - name: Upload outputs
         uses: actions/upload-artifact@v4
         with:
           name: portfolio-outputs
           path: |
             Scripts and CSV Files/chatgpt_portfolio_update.csv
             Scripts and CSV Files/chatgpt_trade_log.csv
+          if-no-files-found: warn
