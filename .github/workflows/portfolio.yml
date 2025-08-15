@@ -1,35 +1,34 @@
-name: run
+name: daily-run
 
 on:
   workflow_dispatch:
-  # schedule:
-  #   - cron: '30 20 * * 1-5'  # exemple: lun-ven 20:30 UTC
+  schedule:
+    - cron: "15 13 * * 1-5"   # Jours ouvrés 13:15 UTC (à adapter)
 
 jobs:
   run:
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install deps
+        shell: bash
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4
+            pip install -q --upgrade pip
+            pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4 pandas-datareader==0.10.0
           fi
 
-      - name: Ensure data dir & seed CSV
+      - name: Prep storage
+        shell: bash
         run: |
           mkdir -p "Scripts and CSV Files"
           FILE="Scripts and CSV Files/chatgpt_portfolio_update.csv"
@@ -37,25 +36,27 @@ jobs:
             echo 'Date,Cash,Equity,SPX_100,Holdings' > "$FILE"
             echo "$(date -u +%F),100.00,100.00,,[]" >> "$FILE"
           fi
-          # Optionnel: exemple de fichier d’ordres du jour (commenté)
-          # ORD="Scripts and CSV Files/pending_orders.csv"
-          # if [ ! -f "$ORD" ]; then
-          #   echo 'Date,Type,Ticker,Shares,Price' > "$ORD"
-          #   echo "$(date -u +%F),BUY,IINN,10," >> "$ORD"
-          # fi
+          ORD="Scripts and CSV Files/pending_orders.csv"
+          if [ ! -f "$ORD" ]; then
+            echo 'Date,Type,Ticker,Shares,Price' > "$ORD"
+            # Exemple (commenté): $(date -u +%F),BUY,SPY,1,
+          fi
 
       - name: Run trading script (non-interactive)
+        env:
+          FAIL_ON_DATA_ERRORS: "false"   # passe à "true" si tu veux que le job échoue si les données marché manquent
+        shell: bash
         run: |
           python -u trading_script.py \
             -f "Scripts and CSV Files/chatgpt_portfolio_update.csv" \
             -d "Scripts and CSV Files" \
+            --orders "Scripts and CSV Files/pending_orders.csv" \
             --non-interactive
 
-      - name: Upload outputs
+      - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
           name: portfolio-outputs
           path: |
             Scripts and CSV Files/chatgpt_portfolio_update.csv
             Scripts and CSV Files/chatgpt_trade_log.csv
-          if-no-files-found: warn
