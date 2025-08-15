@@ -5,7 +5,7 @@ on:
     inputs:
       orders:
         description: >
-          Saisis des ordres séparés par ';' au format: BUY TICKER SHARES [PRICE]
+          Ordres séparés par ';' au format: BUY TICKER SHARES [PRICE]
           ex: "BUY SPY 1; SELL AAPL 2 190"
         required: false
         default: ""
@@ -23,6 +23,11 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       FAIL_ON_DATA_ERRORS: "false"
+      # Secrets (optionnels) pour Alpaca — ajoute-les dans Settings > Secrets and variables > Actions
+      ALPACA_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET: ${{ secrets.ALPACA_API_SECRET }}
+      # Laisse vide pour paper trading par défaut
+      ALPACA_BASE_URL: ${{ secrets.ALPACA_BASE_URL }}
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +41,7 @@ jobs:
           python -m pip install -q --upgrade pip
           pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4 pandas-datareader==0.10.0
 
-      - name: Prep storage & initial CSVs
+      - name: Prep storage & initial CSVs (no heredoc)
         shell: bash
         run: |
           set -euo pipefail
@@ -44,41 +49,30 @@ jobs:
           mkdir -p "$OUTDIR"
 
           PORT="$OUTDIR/chatgpt_portfolio_update.csv"
+          # Crée fichier + ligne initiale si inexistant ou sans données (≤1 ligne: que l'entête)
           if [ ! -f "$PORT" ]; then
             echo 'Date,Cash,Equity,SPX_100,Holdings' > "$PORT"
             echo "$(date -u +%F),${{ github.event.inputs.start_cash }},${{ github.event.inputs.start_cash }},,[]" >> "$PORT"
           else
-            python - <<'PY'
-import pandas as pd, sys
-p="Scripts and CSV Files/chatgpt_portfolio_update.csv"
-try:
-    df=pd.read_csv(p).dropna(how="all")
-    if df.empty:
-        raise Exception()
-except Exception:
-    import datetime
-    with open(p,"w") as f:
-        f.write("Date,Cash,Equity,SPX_100,Holdings\n")
-        today=datetime.datetime.utcnow().date()
-        cash=float("${{ github.event.inputs.start_cash or '100.00' }}")
-        f.write(f"{today},{cash:.2f},{cash:.2f},,[]\n")
-PY
+            # Si le fichier existe mais sans ligne de données (juste l'entête), on initialise
+            if [ "$(wc -l < "$PORT" | tr -d ' ')" -le "1" ]; then
+              tmp="$(mktemp)"
+              echo 'Date,Cash,Equity,SPX_100,Holdings' > "$tmp"
+              echo "$(date -u +%F),${{ github.event.inputs.start_cash }},${{ github.event.inputs.start_cash }},,[]" >> "$tmp"
+              mv "$tmp" "$PORT"
+            fi
           fi
 
+          # Génère le fichier d’ordres du jour à partir de l’input "orders"
           ORD="$OUTDIR/pending_orders.csv"
           echo 'Date,Type,Ticker,Shares,Price' > "$ORD"
           if [ -n "${{ github.event.inputs.orders }}" ]; then
             IFS=';' read -ra PARTS <<< "${{ github.event.inputs.orders }}"
             for p in "${PARTS[@]}"; do
-              # trim
-              p="$(echo "$p" | awk '{$1=$1;print}')"
+              p="$(echo "$p" | awk '{$1=$1;print}')"   # trim
               [ -z "$p" ] && continue
               read -ra f <<< "$p"
-              # attendu: TYPE TICKER SHARES [PRICE]
-              TYPE="${f[0]}"
-              TICK="${f[1]}"
-              SH="${f[2]}"
-              PRICE="${f[3]:-}"
+              TYPE="${f[0]:-}"; TICK="${f[1]:-}"; SH="${f[2]:-}"; PRICE="${f[3]:-}"
               if [ -n "$TYPE" ] && [ -n "$TICK" ] && [ -n "$SH" ]; then
                 echo "$(date -u +%F),$TYPE,$(echo "$TICK" | tr '[:lower:]' '[:upper:]'),$SH,$PRICE" >> "$ORD"
               fi
