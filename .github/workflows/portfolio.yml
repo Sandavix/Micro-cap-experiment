@@ -2,9 +2,8 @@ name: run
 
 on:
   workflow_dispatch:
-  # Décommente si tu veux un run auto (lun-ven 20:30 UTC par ex.)
   # schedule:
-  #   - cron: '30 20 * * 1-5'
+  #   - cron: '30 20 * * 1-5'  # exemple: lun-ven 20:30 UTC
 
 jobs:
   run:
@@ -30,15 +29,20 @@ jobs:
             pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4
           fi
 
-      - name: Ensure CSVs exist
+      - name: Ensure data dir & seed CSV
         run: |
           mkdir -p "Scripts and CSV Files"
           FILE="Scripts and CSV Files/chatgpt_portfolio_update.csv"
           if [ ! -s "$FILE" ]; then
             echo 'Date,Cash,Equity,SPX_100,Holdings' > "$FILE"
-            # Cash/Equity de départ (modifie si besoin)
             echo "$(date -u +%F),100.00,100.00,,[]" >> "$FILE"
           fi
+          # Optionnel: exemple de fichier d’ordres du jour (commenté)
+          # ORD="Scripts and CSV Files/pending_orders.csv"
+          # if [ ! -f "$ORD" ]; then
+          #   echo 'Date,Type,Ticker,Shares,Price' > "$ORD"
+          #   echo "$(date -u +%F),BUY,IINN,10," >> "$ORD"
+          # fi
 
       - name: Run trading script (non-interactive)
         run: |
