@@ -1,339 +1,256 @@
 #!/usr/bin/env python3
-import argparse, os, sys, json, math
-from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple
+# -*- coding: utf-8 -*-
 
+import argparse, os, sys, json, datetime as dt
+from typing import List, Dict, Optional
 import pandas as pd
+import numpy as np
 
-# --- Market data: yfinance primary, Stooq fallback ---
-def _safe_float(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+# ---------- util filesystem ----------
+def ensure_dir(p: str): os.makedirs(p, exist_ok=True)
 
-DATA_ERRORS: List[str] = []
-HARD_FAIL_ON_DATA_ERRORS = os.getenv("FAIL_ON_DATA_ERRORS", "false").lower() == "true"
-
-def _now_utc_date_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-def fetch_from_yahoo_last_close(ticker: str) -> Optional[float]:
-    try:
-        import yfinance as yf
-        # try short period
-        df = yf.Ticker(ticker).history(period="5d", interval="1d", auto_adjust=False)
-        if df is None or df.empty:
-            # fallback download
-            df = yf.download(ticker, period="10d", interval="1d", progress=False)
-        if df is None or df.empty:
-            return None
-        # take last non-na close
-        s = df["Close"].dropna()
-        if s.empty:
-            return None
-        return float(s.iloc[-1])
-    except Exception as e:
-        # yfinance can throw JSONDecodeError when Yahoo hiccups
-        return None
-
-def _to_stooq_symbol(ticker: str) -> str:
-    t = ticker.strip().upper()
-    # Index mappings commonly used
-    if t in ("^GSPC", "^SPX"):
-        return "^spx"         # Stooq index name
-    # ETFs/equities: append .US if no suffix already
-    if "." not in t and not t.startswith("^"):
-        return f"{t}.US"
-    return t
-
-def fetch_from_stooq_last_close(ticker: str) -> Optional[float]:
-    try:
-        from pandas_datareader import data as pdr
-        sym = _to_stooq_symbol(ticker)
-        df = pdr.DataReader(sym, "stooq")
-        if df is None or df.empty:
-            return None
-        # Stooq returns most-recent first; ensure latest close
-        s = df["Close"].dropna()
-        if s.empty:
-            return None
-        return float(s.iloc[0])
-    except Exception:
-        return None
-
-def fetch_price(ticker: str) -> Optional[float]:
-    px = fetch_from_yahoo_last_close(ticker)
-    if px is not None and math.isfinite(px):
-        return px
-    px = fetch_from_stooq_last_close(ticker)
-    if px is not None and math.isfinite(px):
-        return px
-    DATA_ERRORS.append(f"price:{ticker}")
-    print(f"[warn] No data for {ticker}")
-    return None
-
-def fetch_spx_benchmark() -> Optional[float]:
-    # Try SPY first (usually more available), then ^GSPC/^SPX
-    for t in ("SPY", "^GSPC", "^SPX"):
-        px = fetch_price(t)
-        if px is not None:
-            return px
-    # As a last resort, explicit Stooq symbol
-    px = fetch_from_stooq_last_close("^spx")
-    if px is not None:
-        return px
-    DATA_ERRORS.append("benchmark")
-    return None
-
-# --- Portfolio storage helpers ---
-def parse_holdings(cell: str) -> List[Dict]:
-    if isinstance(cell, list):
-        return cell
-    if pd.isna(cell) or not str(cell).strip():
-        return []
-    s = str(cell).strip()
-    # tolerate single quotes
-    if s.startswith("[") and "'" in s and '"' not in s:
-        s = s.replace("'", '"')
-    try:
-        x = json.loads(s)
-        if isinstance(x, list):
-            return x
-        return []
-    except Exception:
-        return []
-
-def holdings_to_cell(holdings: List[Dict]) -> str:
-    return json.dumps(holdings, separators=(",", ":"))
-
-def load_portfolio(csv_path: str) -> pd.DataFrame:
-    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+def load_csv(path: str, cols: List[str]) -> pd.DataFrame:
+    if os.path.exists(path) and os.path.getsize(path) > 0:
         try:
-            return pd.read_csv(csv_path)
+            df = pd.read_csv(path)
+            df = df.dropna(how="all")
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = np.nan
+            return df
+        except Exception as e:
+            print(f"WARN: could not read {path}: {e}", file=sys.stderr)
+    return pd.DataFrame(columns=cols)
+
+def save_csv(df: pd.DataFrame, path: str):
+    df.to_csv(path, index=False)
+
+# ---------- holdings ----------
+def parse_holdings(s) -> List[Dict]:
+    if isinstance(s, str) and s.strip():
+        try:
+            return json.loads(s)
         except Exception:
             pass
-    # init empty frame with expected columns
-    return pd.DataFrame(columns=["Date","Cash","Equity","SPX_100","Holdings"])
+    return []
 
-def save_row(csv_path: str, row: Dict):
-    exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
-    df = pd.DataFrame([row])
-    if exists:
-        df.to_csv(csv_path, mode="a", header=False, index=False)
-    else:
-        df.to_csv(csv_path, index=False)
+def holdings_to_str(h) -> str:
+    return json.dumps(h, separators=(",", ":"))
 
-def load_trade_log(dir_path: str) -> str:
-    path = os.path.join(dir_path, "chatgpt_trade_log.csv")
-    if not os.path.exists(path):
-        pd.DataFrame(columns=["TimestampUTC","Type","Ticker","Shares","Price","Notional"]).to_csv(path, index=False)
-    return path
+def last_numeric(df: pd.DataFrame, col: str, default: float) -> float:
+    if df.empty or col not in df.columns:
+        return default
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    return float(s.iloc[-1]) if not s.empty else default
 
-def append_trade(trade_log_path: str, ttype: str, ticker: str, shares: float, price: float):
-    notional = round(shares * price, 2)
-    row = {
-        "TimestampUTC": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
-        "Type": ttype,
-        "Ticker": ticker.upper(),
-        "Shares": float(shares),
-        "Price": float(price),
-        "Notional": notional,
-    }
-    pd.DataFrame([row]).to_csv(trade_log_path, mode="a", header=False, index=False)
+def upsert_holding(holds: List[Dict], ticker: str, delta_qty: int, price: float):
+    realized = 0.0
+    h = next((x for x in holds if x["ticker"] == ticker), None)
+    if h is None:
+        if delta_qty > 0:
+            holds.append({"ticker": ticker, "qty": int(delta_qty), "avg_cost": float(price)})
+        return holds, realized
+    if delta_qty > 0:  # BUY
+        total_cost = h["avg_cost"] * h["qty"] + price * delta_qty
+        new_qty = h["qty"] + delta_qty
+        h["qty"] = new_qty
+        h["avg_cost"] = total_cost / new_qty
+    else:  # SELL
+        sell_qty = min(h["qty"], -delta_qty)
+        realized = (price - h["avg_cost"]) * sell_qty
+        h["qty"] -= sell_qty
+        if h["qty"] == 0:
+            holds[:] = [x for x in holds if x["ticker"] != ticker]
+    return holds, realized
 
-# --- Order execution ---
-def load_orders(orders_path: str) -> pd.DataFrame:
-    if not orders_path or not os.path.exists(orders_path) or os.path.getsize(orders_path) == 0:
-        return pd.DataFrame(columns=["Date","Type","Ticker","Shares","Price"])
-    df = pd.read_csv(orders_path)
-    # normalize
-    for col in ["Date","Type","Ticker","Shares","Price"]:
-        if col not in df.columns:
-            df[col] = None
-    return df
-
-def clear_orders(orders_path: str):
-    pd.DataFrame(columns=["Date","Type","Ticker","Shares","Price"]).to_csv(orders_path, index=False)
-
-def execute_orders(today: str, cash: float, holdings: List[Dict], orders_df: pd.DataFrame, trade_log_path: str) -> Tuple[float, List[Dict]]:
-    if orders_df is None or orders_df.empty:
-        print("No pending orders.")
-        return cash, holdings
-
-    # Only orders dated up to 'today'
+# ---------- pricing ----------
+def _price_from_yahoo(ticker: str) -> Optional[float]:
     try:
-        orders_df["Date"] = pd.to_datetime(orders_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    except Exception:
-        orders_df["Date"] = today
+        import yfinance as yf
+        tk = yf.Ticker(ticker)
+        p = None
+        # fast_info si dispo
+        try:
+            p = float(tk.fast_info.get("last_price"))
+        except Exception:
+            p = None
+        if p is None:
+            hist = tk.history(period="5d", interval="1d", auto_adjust=False, prepost=False, rounding=False)
+            if not hist.empty:
+                p = float(hist["Close"].dropna().iloc[-1])
+        return p
+    except Exception as e:
+        print(f"Yahoo fail for {ticker}: {e}")
+        return None
 
-    to_exec = orders_df[orders_df["Date"] <= today].copy()
-    if to_exec.empty:
-        print("No eligible orders for today.")
-        return cash, holdings
+def _map_to_stooq(ticker: str) -> Optional[str]:
+    if ticker.startswith("^"):
+        return None
+    if "." in ticker:
+        return ticker
+    # si ticker US simple, Stooq attend .US
+    if ticker.replace("-", "").isalpha():
+        return f"{ticker}.US"
+    return ticker
 
-    # index by ticker for faster updates
-    idx = {h["Ticker"].upper(): i for i, h in enumerate(holdings) if "Ticker" in h}
+def _price_from_stooq(ticker: str) -> Optional[float]:
+    try:
+        import pandas_datareader.data as web
+        t2 = _map_to_stooq(ticker.upper())
+        if not t2:
+            return None
+        df = web.DataReader(t2, "stooq")
+        # stooq retourne la plus récente en première ligne
+        if df is not None and not df.empty:
+            return float(df["Close"].dropna().iloc[0])
+    except Exception as e:
+        print(f"Stooq fail for {ticker}: {e}")
+    return None
 
-    for _, r in to_exec.iterrows():
-        ttype = str(r.get("Type","")).strip().upper()
-        ticker = str(r.get("Ticker","")).strip().upper()
-        shares = _safe_float(r.get("Shares"))
-        limit = _safe_float(r.get("Price"))
+def get_price(ticker: str, manual: Optional[float] = None) -> Optional[float]:
+    if manual is not None and manual > 0:
+        return float(manual)
+    p = _price_from_yahoo(ticker)
+    if p is None:
+        p = _price_from_stooq(ticker)
+    return p
 
-        if not ticker or shares is None or shares <= 0 or ttype not in ("BUY","SELL"):
-            print(f"[skip] Bad order line: {dict(r)}")
+def equity_now(holds: List[Dict], cash: float) -> float:
+    total = cash
+    for h in holds:
+        p = get_price(h["ticker"])
+        if p is None:
+            # fallback: ne pas casser l'update — on valorise au coût moyen
+            p = h["avg_cost"]
+        total += h["qty"] * p
+    return float(total)
+
+# ---------- orders ----------
+def process_orders(orders_path: str, cash: float, holds: List[Dict], trade_log_path: str, keep_orders: bool = False):
+    df = load_csv(orders_path, ["Date", "Type", "Ticker", "Shares", "Price"])
+    if df.empty:
+        print("No pending orders.")
+        return cash, holds, 0
+
+    processed, success = [], 0
+
+    for _, row in df.iterrows():
+        typ = str(row.get("Type", "")).strip().upper()
+        ticker = str(row.get("Ticker", "")).strip().upper()
+        shares = int(pd.to_numeric(row.get("Shares"), errors="coerce") or 0)
+        m = pd.to_numeric(row.get("Price"), errors="coerce")
+        manual_price = float(m) if not np.isnan(m) else None
+
+        if not ticker or shares <= 0 or typ not in ("BUY", "SELL"):
             continue
 
-        last = fetch_price(ticker)
-        if last is None:
-            print(f"[skip] No price for {ticker}")
+        price = get_price(ticker, manual=manual_price)
+        if price is None:
+            print(f"Price unavailable for {ticker}; skipped.")
             continue
 
-        # limit logic
-        if limit is not None:
-            if ttype == "BUY" and last > limit:
-                print(f"[skip] BUY {ticker} limit {limit} not reached (last {last})")
+        if typ == "BUY":
+            max_afford = int(cash // price)
+            qty = min(shares, max_afford)
+            if qty <= 0:
+                print(f"Insufficient cash to buy {ticker}; need {shares}×{price:.2f}, cash {cash:.2f}")
                 continue
-            if ttype == "SELL" and last < limit:
-                print(f"[skip] SELL {ticker} limit {limit} not reached (last {last})")
+            cash -= qty * price
+            holds, _ = upsert_holding(holds, ticker, qty, price)
+        else:
+            have = next((x["qty"] for x in holds if x["ticker"] == ticker), 0)
+            qty = min(have, shares)
+            if qty <= 0:
+                print(f"No position to sell for {ticker}; have {have}, requested {shares}.")
                 continue
-        exec_price = last
+            holds, _ = upsert_holding(holds, ticker, -qty, price)
+            cash += qty * price
 
-        if ttype == "BUY":
-            cost = shares * exec_price
-            if cash + 1e-9 < cost:
-                print(f"[skip] Not enough cash for BUY {ticker} x{shares} @ {exec_price:.4f} (need {cost:.2f}, cash {cash:.2f})")
-                continue
-            cash -= cost
-            if ticker in idx:
-                i = idx[ticker]
-                # simple running average
-                prev_sh = float(holdings[i].get("Shares",0))
-                prev_px = float(holdings[i].get("BuyPrice", exec_price))
-                new_sh = prev_sh + shares
-                avg_px = (prev_sh*prev_px + shares*exec_price) / new_sh if new_sh>0 else exec_price
-                holdings[i]["Shares"] = round(new_sh, 6)
-                holdings[i]["BuyPrice"] = round(avg_px, 6)
-            else:
-                holdings.append({"Ticker": ticker, "Shares": float(shares), "BuyPrice": float(exec_price)})
-                idx[ticker] = len(holdings)-1
-            append_trade(trade_log_path, "BUY", ticker, shares, exec_price)
-            print(f"BUY  {ticker:6s}  x{shares}  @ {exec_price:.4f}")
+        processed.append({
+            "ts": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "type": typ, "ticker": ticker, "shares": qty,
+            "price": round(price, 4), "status": "FILLED"
+        })
+        success += 1
 
-        elif ttype == "SELL":
-            if ticker not in idx:
-                print(f"[skip] No position to SELL for {ticker}")
-                continue
-            i = idx[ticker]
-            pos_sh = float(holdings[i].get("Shares",0))
-            if pos_sh <= 0:
-                print(f"[skip] No shares left in {ticker}")
-                continue
-            sell_qty = min(pos_sh, shares)
-            proceeds = sell_qty * exec_price
-            cash += proceeds
-            new_sh = pos_sh - sell_qty
-            holdings[i]["Shares"] = round(new_sh, 6)
-            if new_sh <= 0:
-                # remove empty position
-                holdings.pop(i)
-                # rebuild index
-                idx = {h["Ticker"].upper(): j for j,h in enumerate(holdings)}
-            append_trade(trade_log_path, "SELL", ticker, sell_qty, exec_price)
-            print(f"SELL {ticker:6s}  x{sell_qty}  @ {exec_price:.4f}")
+    if processed:
+        logdf = load_csv(trade_log_path, ["ts", "type", "ticker", "shares", "price", "status"])
+        logdf = pd.concat([logdf, pd.DataFrame(processed)], ignore_index=True)
+        save_csv(logdf, trade_log_path)
 
-    return cash, holdings
+    if not keep_orders:
+        # garde uniquement ce qui n'a PAS été rempli
+        remaining = []
+        for _, row in df.iterrows():
+            typ = str(row.get("Type", "")).strip().upper()
+            ticker = str(row.get("Ticker", "")).strip().upper()
+            shares = int(pd.to_numeric(row.get("Shares"), errors="coerce") or 0)
+            filled = any(p["ticker"] == ticker and p["type"] == typ and p["shares"] == shares for p in processed)
+            if not filled:
+                remaining.append(row)
+        remdf = pd.DataFrame(remaining, columns=["Date", "Type", "Ticker", "Shares", "Price"])
+        save_csv(remdf, orders_path)
 
-# --- Main ---
+    return cash, holds, success
+
+# ---------- main ----------
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-f", "--file", required=True, help="portfolio CSV file")
-    parser.add_argument("-d", "--dir", required=True, help="output dir (for trade log)")
-    parser.add_argument("--orders", default="", help="pending orders CSV path")
-    parser.add_argument("--non-interactive", action="store_true")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-f", "--file", required=True, help="portfolio CSV path")
+    ap.add_argument("-d", "--dir", required=True, help="output dir")
+    ap.add_argument("--orders", default=None, help="pending_orders CSV")
+    ap.add_argument("--non-interactive", action="store_true")
+    ap.add_argument("--fail-on-data-errors", action="store_true", default=False)
+    ap.add_argument("--keep-orders", action="store_true")
+    args = ap.parse_args()
 
-    os.makedirs(args.dir, exist_ok=True)
-    trade_log_path = load_trade_log(args.dir)
+    ensure_dir(args.dir)
 
-    df = load_portfolio(args.file)
-    today = _now_utc_date_str()
+    portfolio_path = args.file
+    trade_log_path = os.path.join(args.dir, "chatgpt_trade_log.csv")
+    orders_path = args.orders or os.path.join(args.dir, "pending_orders.csv")
 
-    # determine starting state
-    cash = 0.0
-    equity = 0.0
-    spx_100 = ""
-    holdings: List[Dict] = []
+    # bootstrap fichiers
+    if not os.path.exists(portfolio_path):
+        save_csv(pd.DataFrame(columns=["Date", "Cash", "Equity", "SPX_100", "Holdings"]), portfolio_path)
+    if not os.path.exists(trade_log_path):
+        save_csv(pd.DataFrame(columns=["ts", "type", "ticker", "shares", "price", "status"]), trade_log_path)
+    if not os.path.exists(orders_path):
+        save_csv(pd.DataFrame(columns=["Date", "Type", "Ticker", "Shares", "Price"]), orders_path)
 
-    if not df.empty:
-        last = df.iloc[-1]
-        cash = _safe_float(last.get("Cash")) or 0.0
-        equity = _safe_float(last.get("Equity")) or cash
-        spx_100 = "" if pd.isna(last.get("SPX_100")) else last.get("SPX_100")
-        holdings = parse_holdings(last.get("Holdings"))
-    else:
-        cash = 100.0
-        equity = 100.0
-        holdings = []
+    # charge dernier état
+    df = load_csv(portfolio_path, ["Date", "Cash", "Equity", "SPX_100", "Holdings"])
+    cash = last_numeric(df, "Cash", 100.0)
+    equity = last_numeric(df, "Equity", cash)
+    holds = []
+    if "Holdings" in df.columns and not df.empty:
+        s = df["Holdings"].dropna().astype(str)
+        s = s[s.str.strip() != ""]
+        holds = parse_holdings(s.iloc[-1]) if not s.empty else []
 
-    # 1) Execute pending orders (if any)
-    orders_df = load_orders(args.orders) if args.orders else pd.DataFrame()
-    cash, holdings = execute_orders(today, cash, holdings, orders_df, trade_log_path)
-    if args.orders:
-        clear_orders(args.orders)
+    # exécute ordres
+    cash, holds, n = process_orders(orders_path, cash, holds, trade_log_path, args.keep_orders)
 
-    # 2) Price positions for equity calc
-    pos_value = 0.0
-    if holdings:
-        print("Current holdings (post-orders):")
-        print("Ticker    Shares      BuyPx       LastPx       Value")
-        for h in holdings:
-            t = h.get("Ticker")
-            sh = float(h.get("Shares",0))
-            last = fetch_price(t)
-            last = last if last is not None else 0.0
-            val = sh * last
-            pos_value += val
-            print(f"{t:6s}  {sh:8.4f}  {float(h.get('BuyPrice',0)):<10.4f}  {last:<10.4f}  {val:<10.2f}")
-    else:
-        print("No holdings.")
+    # valorisation
+    equity = equity_now(holds, cash)
 
-    equity = round(cash + pos_value, 2)
-
-    # 3) Benchmark (optional)
-    spx_px = fetch_spx_benchmark()
-    if spx_px is None:
-        print("S&P 500 data unavailable; skipping benchmark.")
-        spx_cell = ""
-    else:
-        spx_cell = f"{spx_px:.4f}"
-
-    # 4) Write daily row
-    row = {
+    # écris la journée
+    today = dt.datetime.utcnow().date().isoformat()
+    row = pd.DataFrame([{
         "Date": today,
-        "Cash": f"{cash:.2f}",
-        "Equity": f"{equity:.2f}",
-        "SPX_100": spx_cell,
-        "Holdings": holdings_to_cell(holdings),
-    }
-    save_row(args.file, row)
+        "Cash": round(cash, 2),
+        "Equity": round(equity, 2),
+        "SPX_100": "",
+        "Holdings": holdings_to_str(holds)
+    }])
+    df = pd.concat([df, row], ignore_index=True)
+    save_csv(df, portfolio_path)
 
+    print(f"Processed orders: {n}")
+    print(f"Holdings: {holdings_to_str(holds)}")
     print(f"cash balance: {cash:.2f}")
     print("Daily update complete.")
-
-    if HARD_FAIL_ON_DATA_ERRORS and DATA_ERRORS:
-        print(f"::error title=Data errors detected::{', '.join(DATA_ERRORS)}")
-        sys.exit(1)
-
-    # Sharpe/Sortino placeholder (requires longer history)
-    try:
-        hist = load_portfolio(args.file)
-        if hist is None or len(hist) < 5:
-            print("Could not compute Sharpe/Sortino: Not enough data")
-    except Exception:
-        print("Could not compute Sharpe/Sortino: Not enough data")
-
+    return 0
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
