@@ -528,14 +528,49 @@ def daily_results(chatgpt_portfolio: pd.DataFrame, cash: float) -> None:
     spx = spx.reset_index()
 
     # Normalize to $100
-    initial_price = spx["Close"].iloc[0].item()
-    price_now = spx["Close"].iloc[-1].item()
-    scaling_factor = 100 / initial_price
-    spx_value = price_now * scaling_factor
-    print(f"$100 Invested in the S&P 500: ${spx_value:.2f}")
-    print("today's portfolio:")
-    print(chatgpt_portfolio)
-    print(f"cash balance: {cash}")
+    # --- Benchmark S&P 500 robuste (remplace l'ancien bloc) ---
+import numpy as np
+
+def _safe_close_first(df) -> float | None:
+    try:
+        close = (df.get("Close") if isinstance(df, pd.DataFrame) else None)
+        if close is None:
+            return None
+        close = close.dropna()
+        return float(close.iloc[0]) if not close.empty else None
+    except Exception:
+        return None
+
+def _download_benchmark(start_dt, end_dt):
+    # ordre de repli: ^GSPC -> SPY -> IVV -> VOO -> ^SPX
+    for sym in ("^GSPC", "SPY", "IVV", "VOO", "^SPX"):
+        try:
+            df = robust_history(sym, start=start_dt, end=end_dt)
+            first = _safe_close_first(df)
+            if first is not None:
+                print(f"Benchmark fallback in use: {sym}")
+                return sym, df, first
+        except Exception:
+            pass
+    return None, pd.DataFrame({"Close": pd.Series(dtype=float)}), None
+
+# bornes de dates : garde ce que tu avais (start fixe ou variable) 
+start_dt = pd.to_datetime("2025-06-27")   # adapte si tu avais une autre variable
+end_dt   = final_date + pd.Timedelta(days=1)
+
+bench_sym, spx, initial_price = _download_benchmark(start_dt, end_dt)
+
+if initial_price is None:
+    print("Benchmark fetch failed; continuing without baseline.")
+    # protège toute la suite qui utilise le benchmark
+    spx_index = pd.Series(index=pd.date_range(start_dt, final_date, freq="B"), dtype=float)
+    hundred_in_spx = np.nan
+else:
+    # ex: normalisation « $100 investi »
+    spx_close = spx["Close"].dropna()
+    spx_index = (spx_close / initial_price) * 100.0
+    hundred_in_spx = float(spx_index.iloc[-1])
+    print(f"$100 Invested in the S&P 500: ${hundred_in_spx:.2f}")
 
     print(
         "Here are is your update for today. You can make any changes you see fit (if necessary),\n"
