@@ -1,34 +1,49 @@
-name: Portfolio
+name: run
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [ main ]
+  workflow_dispatch: {}
+  # (optionnel) déclenchement auto les jours ouvrés à 16:30 UTC
   # schedule:
-  #   - cron: "30 20 * * 1-5"  # (ex) tous les jours ouvrés à 20:30 UTC
+  #   - cron: "30 16 * * 1-5"
+
+permissions:
+  contents: read
 
 jobs:
   run:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
 
-      - name: Install deps
+      - name: Install dependencies
+        shell: bash
         run: |
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install -q --upgrade pip
             # fallback minimal si pas de requirements.txt
-            pip install pandas
+            pip install -q --upgrade pip
+            pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4
+          fi
+
+      # >>> Étape qui "seed" le CSV si vide / absent <<<
+      - name: Seed portfolio CSV if empty
+        shell: bash
+        run: |
+          mkdir -p "Scripts and CSV Files"
+          FILE="Scripts and CSV Files/chatgpt_portfolio_update.csv"
+          if [ ! -s "$FILE" ]; then
+            echo 'Date,Cash,Equity,SPX_100,Holdings' > "$FILE"
+            # Choisis le cash de départ ici (100 par défaut)
+            echo "$(date -u +%F),100.00,100.00,,[]" >> "$FILE"
           fi
 
       - name: Run trading script (non-interactive)
@@ -39,9 +54,7 @@ jobs:
             -d "Scripts and CSV Files" \
             --non-interactive
 
-      # (facultatif) Publier les fichiers mis à jour comme artefacts
       - name: Upload artifacts
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: portfolio-outputs
