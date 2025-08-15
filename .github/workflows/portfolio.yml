@@ -1,59 +1,100 @@
-name: daily-run
+name: portfolio
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "15 13 * * 1-5"   # Jours ouvrés 13:15 UTC (à adapter)
+    inputs:
+      orders:
+        description: >
+          Saisis des ordres séparés par ';' au format: BUY TICKER SHARES [PRICE]
+          ex: "BUY SPY 1; SELL AAPL 2 190"
+        required: false
+        default: ""
+      start_cash:
+        description: Cash de départ si le fichier est vide
+        required: false
+        default: "100.00"
+      keep_orders:
+        description: Laisser les ordres non exécutés dans le fichier
+        type: boolean
+        default: false
 
 jobs:
   run:
     runs-on: ubuntu-24.04
+    env:
+      FAIL_ON_DATA_ERRORS: "false"
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
       - name: Install deps
+        run: |
+          python -m pip install -q --upgrade pip
+          pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4 pandas-datareader==0.10.0
+
+      - name: Prep storage & initial CSVs
         shell: bash
         run: |
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
+          set -euo pipefail
+          OUTDIR="Scripts and CSV Files"
+          mkdir -p "$OUTDIR"
+
+          PORT="$OUTDIR/chatgpt_portfolio_update.csv"
+          if [ ! -f "$PORT" ]; then
+            echo 'Date,Cash,Equity,SPX_100,Holdings' > "$PORT"
+            echo "$(date -u +%F),${{ github.event.inputs.start_cash }},${{ github.event.inputs.start_cash }},,[]" >> "$PORT"
           else
-            pip install -q --upgrade pip
-            pip install numpy==1.26.4 pandas==2.2.2 yfinance==0.2.38 matplotlib==3.8.4 pandas-datareader==0.10.0
+            python - <<'PY'
+import pandas as pd, sys
+p="Scripts and CSV Files/chatgpt_portfolio_update.csv"
+try:
+    df=pd.read_csv(p).dropna(how="all")
+    if df.empty:
+        raise Exception()
+except Exception:
+    import datetime
+    with open(p,"w") as f:
+        f.write("Date,Cash,Equity,SPX_100,Holdings\n")
+        today=datetime.datetime.utcnow().date()
+        cash=float("${{ github.event.inputs.start_cash or '100.00' }}")
+        f.write(f"{today},{cash:.2f},{cash:.2f},,[]\n")
+PY
           fi
 
-      - name: Prep storage
-        shell: bash
-        run: |
-          mkdir -p "Scripts and CSV Files"
-          FILE="Scripts and CSV Files/chatgpt_portfolio_update.csv"
-          if [ ! -s "$FILE" ]; then
-            echo 'Date,Cash,Equity,SPX_100,Holdings' > "$FILE"
-            echo "$(date -u +%F),100.00,100.00,,[]" >> "$FILE"
-          fi
-          ORD="Scripts and CSV Files/pending_orders.csv"
-          if [ ! -f "$ORD" ]; then
-            echo 'Date,Type,Ticker,Shares,Price' > "$ORD"
-            # Exemple (commenté): $(date -u +%F),BUY,SPY,1,
+          ORD="$OUTDIR/pending_orders.csv"
+          echo 'Date,Type,Ticker,Shares,Price' > "$ORD"
+          if [ -n "${{ github.event.inputs.orders }}" ]; then
+            IFS=';' read -ra PARTS <<< "${{ github.event.inputs.orders }}"
+            for p in "${PARTS[@]}"; do
+              # trim
+              p="$(echo "$p" | awk '{$1=$1;print}')"
+              [ -z "$p" ] && continue
+              read -ra f <<< "$p"
+              # attendu: TYPE TICKER SHARES [PRICE]
+              TYPE="${f[0]}"
+              TICK="${f[1]}"
+              SH="${f[2]}"
+              PRICE="${f[3]:-}"
+              if [ -n "$TYPE" ] && [ -n "$TICK" ] && [ -n "$SH" ]; then
+                echo "$(date -u +%F),$TYPE,$(echo "$TICK" | tr '[:lower:]' '[:upper:]'),$SH,$PRICE" >> "$ORD"
+              fi
+            done
           fi
 
-      - name: Run trading script (non-interactive)
-        env:
-          FAIL_ON_DATA_ERRORS: "false"   # passe à "true" si tu veux que le job échoue si les données marché manquent
+      - name: Run trading script
         shell: bash
         run: |
           python -u trading_script.py \
             -f "Scripts and CSV Files/chatgpt_portfolio_update.csv" \
             -d "Scripts and CSV Files" \
             --orders "Scripts and CSV Files/pending_orders.csv" \
-            --non-interactive
+            --non-interactive $([ "${{ github.event.inputs.keep_orders }}" = "true" ] && echo "--keep-orders" || true)
 
-      - name: Upload CSV artifacts
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: portfolio-outputs
